@@ -1,0 +1,9 @@
+from app.models.user import User  # noqa: F401
+from app.models.upload_job import UploadJob  # noqa: F401
+from app.models.cleaned_dataset import CleanedDataset  # noqa: F401
+from app.models.cleaning_log import CleaningLog  # noqa: F401
+from app.models.user_goal import UserGoal  # noqa: F401
+from app.models.chart import Chart  # noqa: F401
+from app.models.insight import Insight  # noqa: F401
+from app.models.annotation import Annotation  # noqa: F401
+from app.models.comparison_job import ComparisonJob  # noqa: F401
