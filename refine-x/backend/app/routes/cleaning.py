@@ -121,7 +121,22 @@ def missing_fields(
     for col in df.columns:
         count = int(df[col].isnull().sum())
         if count > 0:
-            missing[col] = {"count": count, "percentage": round(count / len(df) * 100, 2)}
+            pct = round(count / len(df) * 100, 2)
+            dtype = str(df[col].dtype)
+            if dtype in ("float64", "int64", "int32"):
+                strategy = "fill_with_median"
+            elif dtype == "object":
+                strategy = "fill_with_mode"
+            elif "datetime" in dtype:
+                strategy = "fill_with_forward_fill"
+            else:
+                strategy = "fill_with_mode"
+            missing[col] = {
+                "count": count,
+                "percentage": pct,
+                "dtype": dtype,
+                "suggested_fill_strategy": strategy,
+            }
 
     return MissingFieldsResponse(job_id=job_id, missing=missing)
 

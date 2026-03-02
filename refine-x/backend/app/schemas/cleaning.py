@@ -33,6 +33,8 @@ class AuditLogEntry(BaseModel):
     original_value: Optional[str]
     new_value: Optional[str]
     reason: str
+    formula_id: Optional[str] = None
+    was_auto_applied: Optional[bool] = None
     timestamp: datetime
 
     model_config = {"from_attributes": True}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from openai import RateLimitError, AuthenticationError, APIStatusError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -134,10 +135,13 @@ def get_comparison_insight(
     if comp.status != "completed":
         raise HTTPException(status_code=400, detail="Confirm mapping first")
 
-    insight = generate_comparison_insight(
-        deltas=comp.deltas or [],
-        significant=comp.significant_changes or [],
-    )
+    try:
+        insight = generate_comparison_insight(
+            deltas=comp.deltas or [],
+            significant=comp.significant_changes or [],
+        )
+    except (RateLimitError, AuthenticationError, APIStatusError):
+        insight = "AI comparison insight unavailable (OpenAI quota exceeded). Review the deltas and significant_changes fields for detailed differences between the two datasets."
     comp.ai_insight = insight
     db.commit()
     return {"comparison_id": comparison_id, "insight": insight}

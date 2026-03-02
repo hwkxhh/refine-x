@@ -27,7 +27,54 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    from app.config import settings
+    results = {}
+    overall = "healthy"
+
+    # ── PostgreSQL ────────────────────────────────────────────────────
+    try:
+        from app.database import engine
+        with engine.connect() as conn:
+            conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+        results["database"] = "healthy"
+    except Exception as e:
+        results["database"] = f"unhealthy: {e}"
+        overall = "degraded"
+
+    # ── Redis ─────────────────────────────────────────────────────────
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(settings.REDIS_URL, socket_connect_timeout=3)
+        r.ping()
+        results["redis"] = "healthy"
+    except Exception as e:
+        results["redis"] = f"unhealthy: {e}"
+        overall = "degraded"
+
+    # ── Celery ────────────────────────────────────────────────────────
+    try:
+        from celery_app import celery_app
+        insp = celery_app.control.inspect(timeout=3)
+        active = insp.ping()
+        if active:
+            results["celery"] = "healthy"
+        else:
+            results["celery"] = "unhealthy: no workers responding"
+            overall = "degraded"
+    except Exception as e:
+        results["celery"] = f"unhealthy: {e}"
+        overall = "degraded"
+
+    # ── MinIO ─────────────────────────────────────────────────────────
+    try:
+        from app.services.storage import storage_service
+        storage_service.s3_client.list_buckets()
+        results["minio"] = "healthy"
+    except Exception as e:
+        results["minio"] = f"unhealthy: {e}"
+        overall = "degraded"
+
+    return {"status": overall, "services": results}
 
 
 app.include_router(auth_router)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from openai import RateLimitError, AuthenticationError, APIStatusError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -57,17 +58,59 @@ def analyze_job_headers(
     df = _get_df_or_422(job_id)
 
     sample_rows = df.head(5).fillna("").to_dict(orient="records")
-    result = analyze_headers(
-        columns=df.columns.tolist(),
-        sample_rows=sample_rows,
-        filename=job.filename,
+
+    try:
+        result = analyze_headers(
+            columns=df.columns.tolist(),
+            sample_rows=sample_rows,
+            filename=job.filename,
+        )
+    except (RateLimitError, AuthenticationError, APIStatusError):
+        # GPT unavailable — return all columns as essential with no AI suggestions
+        return HeaderAnalysisResponse(
+            job_id=job_id,
+            unnecessary_columns=[],
+            essential_columns=df.columns.tolist(),
+            dataset_summary=(
+                f"{job.filename} — {len(df)} rows × {len(df.columns)} columns. "
+                "AI classification unavailable (OpenAI quota exceeded)."
+            ),
+        )
+
+    # Legacy analyze_headers returns {"columns": {"col": {"htype": ..., "confidence": ...}}}
+    # Derive unnecessary/essential from confidence scores
+    columns_data = result.get("columns", {})
+    unnecessary = []
+    essential = []
+    for col, info in columns_data.items():
+        htype = info.get("htype", "HTYPE-000")
+        confidence = info.get("confidence", 0.5)
+        if htype == "HTYPE-000" or confidence < 0.5:
+            unnecessary.append({
+                "column": col,
+                "reason": f"Low confidence classification ({confidence:.0%}) — column may be redundant or duplicated",
+                "impact_if_removed": "Low — column appears to contain unclear or derived data",
+            })
+        else:
+            essential.append(col)
+
+    # Build a brief dataset summary from the HTYPE distribution
+    htype_counts: dict[str, int] = {}
+    for info in columns_data.values():
+        h = info.get("htype", "HTYPE-000")
+        htype_counts[h] = htype_counts.get(h, 0) + 1
+    top_types = sorted(htype_counts.items(), key=lambda x: -x[1])[:3]
+    summary_parts = [f"{h} ×{c}" for h, c in top_types]
+    dataset_summary = (
+        f"{job.filename} — {len(df)} rows × {len(df.columns)} columns. "
+        f"Dominant types: {', '.join(summary_parts)}."
     )
 
     return HeaderAnalysisResponse(
         job_id=job_id,
-        unnecessary_columns=result.get("unnecessary_columns", []),
-        essential_columns=result.get("essential_columns", []),
-        dataset_summary=result.get("dataset_summary", ""),
+        unnecessary_columns=unnecessary,
+        essential_columns=essential,
+        dataset_summary=dataset_summary,
     )
 
 
@@ -139,12 +182,21 @@ def formula_suggestions(
         dataset_summary = cleaned.cleaning_summary.get("dataset_summary")
 
     sample_rows = df.head(5).fillna("").to_dict(orient="records")
-    result = suggest_formulas(
-        columns=df.columns.tolist(),
-        sample_rows=sample_rows,
-        filename=job.filename,
-        dataset_summary=dataset_summary,
-    )
+
+    try:
+        result = suggest_formulas(
+            columns=df.columns.tolist(),
+            sample_rows=sample_rows,
+            filename=job.filename,
+            dataset_summary=dataset_summary,
+        )
+    except (RateLimitError, AuthenticationError, APIStatusError):
+        # GPT unavailable — return empty suggestions with graceful message
+        return FormulaSuggestionsResponse(
+            job_id=job_id,
+            suggested_analyses=[],
+            recommended_visualizations=[],
+        )
 
     return FormulaSuggestionsResponse(
         job_id=job_id,

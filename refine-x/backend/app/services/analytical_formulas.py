@@ -160,7 +160,12 @@ def calculate_percentile(values: List[float], p: float) -> float:
     """Calculate percentile (0-100)."""
     if not values:
         return 0.0
-    sorted_vals = sorted(values)
+    try:
+        sorted_vals = sorted(float(v) for v in values if v is not None)
+    except (TypeError, ValueError):
+        return 0.0
+    if not sorted_vals:
+        return 0.0
     n = len(sorted_vals)
     k = (p / 100) * (n - 1)
     f = math.floor(k)
@@ -1007,7 +1012,15 @@ class AnalyticalFormulas:
         
         # Detect column types
         self.date_col = detect_date_column(df, htype_map)
-        self.numeric_cols = detect_numeric_columns(df, htype_map)
+        _raw_numeric = detect_numeric_columns(df, htype_map)
+        # Filter to only columns whose actual dtype is numeric (int/float).
+        # Upstream cleaning rules may have upcast a column to object dtype
+        # (e.g. VER-01 writing "v0.0" into an int64 col), which would break
+        # arithmetic in the analytics helpers.
+        self.numeric_cols = [
+            c for c in _raw_numeric
+            if c in df.columns and df[c].dtype.kind in ("i", "f", "u")
+        ]
         self.categorical_cols = detect_categorical_columns(df, htype_map)
     
     def log_action(self, action: str, details: str):
@@ -1079,6 +1092,12 @@ class AnalyticalFormulas:
         
         for col in self.numeric_cols:
             values = self.df[col].dropna().tolist()
+            # Guard: skip if column contains non-numeric values (e.g. after
+            # dtype was upcast to object by an upstream cleaning rule).
+            try:
+                values = [float(v) for v in values]
+            except (TypeError, ValueError):
+                continue
             
             if len(values) >= 3:
                 # AN-10: Trend
@@ -1119,8 +1138,14 @@ class AnalyticalFormulas:
         }
         
         for col in self.numeric_cols:
-            values = self.df[col].tolist()
-            
+            raw = self.df[col].dropna().tolist()
+            try:
+                values = [float(v) for v in raw]
+            except (TypeError, ValueError):
+                continue
+            if not values:
+                continue
+
             # AN-13: Percentiles
             results["percentiles"][col] = an_13_percentile_calculation(values)
             

@@ -1729,19 +1729,29 @@ class OrgProductRules:
     def VER_01_format_standardization(self, col: str) -> CleaningResult:
         """VER-01: Standardize version format to vX.Y or vX.Y.Z."""
         result = CleaningResult(column=col, formula_id="VER-01")
-        
+
+        # Skip entirely for numeric columns — integers/floats are never version
+        # strings. Writing 'v0.0' into an int64 column raises TypeError.
+        if self.df[col].dtype.kind in ("i", "f"):
+            return result
+
+        # Skip if no value looks like a dotted version (e.g. "1.0", "2.3.4")
+        str_vals = self.df[col].dropna().astype(str)
+        if not any("." in v or v.lstrip("v").replace(".", "").isdigit() for v in str_vals.head(20)):
+            return result
+
         for idx, val in self.df[col].items():
             if pd.isna(val):
                 continue
-            
+
             normalized = normalize_version(str(val))
             if normalized != str(val):
                 self.df.at[idx, col] = normalized
                 result.changes_made += 1
-        
+
         if result.changes_made > 0:
             self.log_cleaning(result)
-        
+
         return result
     
     def VER_02_semantic_version_parsing(self, col: str) -> CleaningResult:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from openai import RateLimitError, AuthenticationError, APIStatusError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -91,11 +92,15 @@ def get_recommendations(
 
     df = _get_df_or_422(job_id)
     sample = df.head(5).fillna("").to_dict(orient="records")
-    recs = recommend_headers(
-        column_names=df.columns.tolist(),
-        data_sample=sample,
-        user_goal=goal.goal_text,
-    )
+    try:
+        recs = recommend_headers(
+            column_names=df.columns.tolist(),
+            data_sample=sample,
+            user_goal=goal.goal_text,
+        )
+    except (RateLimitError, AuthenticationError, APIStatusError):
+        # GPT quota exhausted — return empty list gracefully
+        recs = []
     return recs
 
 

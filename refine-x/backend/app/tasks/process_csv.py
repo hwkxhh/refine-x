@@ -339,6 +339,19 @@ def process_csv_file(self, job_id: int):
         summary = pipeline.run_all()
         cleaned_df = pipeline.df
 
+        # ── Merge GlobalRules renames into summary ────────────────────
+        # GlobalRules normalises column names (GLOBAL-03) before the
+        # DataCleaningPipeline runs, so the pipeline sees 0 renames.
+        # Add the GlobalRules rename count here.
+        global_renames = global_summary.get("columns_renamed", {})
+        summary["columns_renamed"] = (
+            summary.get("columns_renamed", 0)
+            + (len(global_renames) if isinstance(global_renames, dict) else int(global_renames))
+        )
+        # Merge row_count_original into summary for completeness
+        summary["row_count_original"] = original_row_count
+        summary["row_count_cleaned"] = len(cleaned_df)
+
         # ── Quality score ─────────────────────────────────────────────
         quality = calculate_quality_score(cleaned_df, original_row_count)
 

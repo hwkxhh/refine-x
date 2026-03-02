@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from openai import RateLimitError, AuthenticationError, APIStatusError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -49,13 +50,24 @@ def generate_insight(
     if df is None:
         raise HTTPException(status_code=422, detail="Cached data not available")
 
-    result = generate_chart_insight(
-        chart_type=chart.chart_type,
-        x_header=chart.x_header,
-        y_header=chart.y_header,
-        chart_data=chart.data or [],
-        user_goal=user_goal,
-    )
+    try:
+        result = generate_chart_insight(
+            chart_type=chart.chart_type,
+            x_header=chart.x_header,
+            y_header=chart.y_header,
+            chart_data=chart.data or [],
+            user_goal=user_goal,
+        )
+    except (RateLimitError, AuthenticationError, APIStatusError):
+        result = {
+            "insight": (
+                f"AI insight unavailable (OpenAI quota exceeded). "
+                f"Chart shows {chart.chart_type} of {chart.x_header} vs {chart.y_header}."
+            ),
+            "confidence": "low",
+            "confidence_score": 0.0,
+            "recommendations": [],
+        }
 
     insight = Insight(
         chart_id=chart_id,

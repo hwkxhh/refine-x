@@ -1,5 +1,6 @@
 """Redis caching helpers for cleaned DataFrames."""
 
+import io
 import redis
 import pandas as pd
 
@@ -24,7 +25,7 @@ def get_cached_dataframe(job_id: int) -> pd.DataFrame | None:
     raw = _client.get(_key(job_id))
     if raw is None:
         return None
-    return pd.read_json(raw, orient="records")
+    return pd.read_json(io.StringIO(raw), orient="records")
 
 
 def delete_cached_dataframe(job_id: int) -> None:
