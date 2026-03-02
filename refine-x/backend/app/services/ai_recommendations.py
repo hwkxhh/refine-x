@@ -1,6 +1,6 @@
 """
-AI Recommendation Engine — uses GPT-4o to suggest chart column pairings
-based on user's analytical goal.
+AI Recommendation Engine — Stage 4: Strict JSON chart specifications.
+Uses GPT-4o to suggest chart column pairings based on user's analytical goal.
 """
 
 import json
@@ -11,6 +11,19 @@ from openai import OpenAI
 from app.config import settings
 
 _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+# Fixed allowed chart types - ChartEngine must support all of these
+ALLOWED_CHART_TYPES = [
+    "bar",
+    "horizontal_bar", 
+    "line",
+    "scatter",
+    "pie",
+    "donut",
+    "stacked_bar",
+    "area",
+    "heatmap",
+]
 
 
 def _parse_json(text: str):
@@ -24,19 +37,22 @@ def recommend_headers(
     user_goal: str,
 ) -> list[dict]:
     """
-    Returns 5 recommended X/Y column pairings.
-
+    Stage 4: Returns strict JSON chart specifications.
+    
     Each item:
     {
-        "x_col": str,
-        "y_col": str | null,
-        "chart_type": str,
-        "relevance_score": float (0-1),
-        "reasoning": str
+        "chart_title": str,
+        "chart_type": str (from ALLOWED_CHART_TYPES),
+        "x_column": str,
+        "y_column": str | null,
+        "reason": str
     }
+    
+    ChartEngine reads this JSON directly without further GPT calls.
     """
     columns_text = ", ".join(f'"{c}"' for c in column_names)
     sample_text = json.dumps(data_sample[:5], default=str, indent=2)
+    chart_types_text = ", ".join(ALLOWED_CHART_TYPES)
 
     prompt = f"""You are a data analyst helping a user visualize their data.
 
@@ -46,31 +62,66 @@ Sample data (first 5 rows):
 
 User's analytical goal: "{user_goal}"
 
-Recommend exactly 5 X vs Y column pairings that would create the most useful and relevant charts for this goal.
-For pie charts, only provide x_col and set y_col to null.
+Recommend exactly 5 chart specifications that would create the most useful visualizations for this goal.
 
-Return ONLY valid JSON array:
+ALLOWED chart types (use ONLY these exact values): {chart_types_text}
+
+For pie/donut charts, set y_column to null.
+
+Return ONLY this exact JSON structure (no other text):
 [
   {{
-    "x_col": "column_name",
-    "y_col": "column_name_or_null",
-    "chart_type": "line|bar|scatter|pie",
-    "relevance_score": 0.95,
-    "reasoning": "Why this pairing is relevant to the user's goal"
+    "chart_title": "Revenue by Store",
+    "chart_type": "bar",
+    "x_column": "store_name",
+    "y_column": "revenue",
+    "reason": "Compare revenue across stores"
   }}
 ]
 
-Only use column names that actually exist in the dataset."""
+Rules:
+- Only use column names that actually exist in the dataset
+- chart_type MUST be from the allowed list above
+- chart_title should be descriptive and specific
+- reason should explain why this chart answers the user's goal"""
 
     response = _client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=1200,
+        temperature=0.2,
+        max_tokens=1500,
     )
 
     result = _parse_json(response.choices[0].message.content)
+    
     # Ensure it's a list
     if isinstance(result, dict):
         result = list(result.values())[0] if result else []
-    return result[:5]
+    
+    # Validate and normalize results
+    validated = []
+    for item in result[:5]:
+        # Validate chart_type
+        chart_type = item.get("chart_type", "bar").lower()
+        if chart_type not in ALLOWED_CHART_TYPES:
+            chart_type = "bar"  # fallback
+        
+        # Validate columns exist
+        x_col = item.get("x_column") or item.get("x_col")
+        y_col = item.get("y_column") or item.get("y_col")
+        
+        if x_col not in column_names:
+            continue  # skip invalid recommendations
+        
+        if y_col and y_col not in column_names:
+            y_col = None
+            
+        validated.append({
+            "chart_title": item.get("chart_title", f"{y_col or 'Count'} by {x_col}"),
+            "chart_type": chart_type,
+            "x_column": x_col,
+            "y_column": y_col,
+            "reason": item.get("reason", item.get("reasoning", ""))
+        })
+    
+    return validated

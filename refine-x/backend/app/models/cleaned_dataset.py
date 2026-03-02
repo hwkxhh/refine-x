@@ -34,6 +34,15 @@ class CleanedDataset(Base):
     # PII tags — {column_name: {level, label}}  (populated by GLOBAL-10)
     pii_tags = Column(JSON, nullable=True)
 
+    # AI Classification flags — pending-review items for columns where AI
+    # confidence was below 0.85 (medium) or below 0.60 (low). Includes conflict
+    # between AI classification and HtypeDetector for user confirmation.
+    ai_classification_flags = Column(JSON, nullable=True)
+
+    # AI Formulas — Stage 2 formula assignments from classify_and_assign()
+    # {column_name: ["FORMULA-ID-1", "FORMULA-ID-2", ...]}
+    ai_formulas = Column(JSON, nullable=True)
+
     # STRUCT rules output — pending-review flags from Session 2 structural checks
     # List of {formula_id, flag_type, description, affected_columns, suggested_action}
     struct_flags = Column(JSON, nullable=True)
@@ -57,6 +66,35 @@ class CleanedDataset(Base):
     # Boolean, Category & Status rules output (Session 8) — pending-review flags for
     # BOOL, CAT, STAT, SURV, MULTI HTYPEs
     boolean_category_flags = Column(JSON, nullable=True)
+
+    # Organizational & Product rules output (Session 9) — pending-review flags for
+    # PROD, SKU, ORG, JOB, DEPT, REFNO, VER HTYPEs
+    org_product_flags = Column(JSON, nullable=True)
+
+    # Text & Technical rules output (Session 10) — pending-review flags for
+    # TEXT, URL, IP, FILE HTYPEs
+    text_technical_flags = Column(JSON, nullable=True)
+
+    # Missing Value Decision Matrix output (Session 12) — flags for missing values
+    # that require user confirmation or were auto-filled with derivation info
+    missing_value_flags = Column(JSON, nullable=True)
+
+    # Duplicate Resolution output (Session 13) — flags for duplicate records
+    # that require user review (partial, fuzzy, temporal) or were auto-removed (exact)
+    duplicate_flags = Column(JSON, nullable=True)
+
+    # Analytical Formulas output (Session 14) — post-cleaning insights and metrics
+    # including trends, correlations, distributions, forecasts, and derived analytics
+    analytical_results = Column(JSON, nullable=True)
+
+    # Conditional Validation output (Session 15) — cross-column validation flags
+    # that require user review for logical inconsistencies between related columns
+    conditional_flags = Column(JSON, nullable=True)
+
+    # Medical Rules output (Session 16) — DIAG and PHYS formula flags
+    # HTYPE-031 (Medical Diagnosis) is HIGH-SENSITIVITY PII - restricted export
+    # HTYPE-032 (Physical Measurement) includes BMI derivation and validation
+    medical_flags = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
