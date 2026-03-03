@@ -296,6 +296,213 @@ def analyze_headers(
     return legacy_result
 
 
+# ============================================================================
+# VISUALIZATION & ANALYSIS SUGGESTIONS — used by /formula-suggestions route
+# ============================================================================
+
+def _build_suggestions_deterministically(columns: list[str], df) -> dict:
+    """
+    Fallback: generate suggested_analyses and recommended_visualizations
+    from column types without calling GPT.
+    """
+    import pandas as pd
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    cat_cols = [c for c in df.select_dtypes(include=["object", "category"]).columns.tolist()
+                if df[c].nunique() <= 30]
+    date_cols = [c for c in columns if any(k in str(c).lower() for k in ["date", "time", "year", "month", "period"])]
+
+    analyses = []
+    vizzes = []
+
+    # Suggested analyses from numeric pairs
+    if len(numeric_cols) >= 2:
+        analyses.append({
+            "name": "Correlation Analysis",
+            "description": f"Explore relationships between {numeric_cols[0]} and {numeric_cols[1]}",
+            "columns_needed": numeric_cols[:2],
+            "formula_type": "correlation",
+            "example": f"Does {numeric_cols[0]} increase when {numeric_cols[1]} increases?",
+        })
+        vizzes.append({
+            "chart_type": "scatter",
+            "x_column": numeric_cols[0],
+            "y_column": numeric_cols[1],
+            "reason": f"Scatter plot to reveal correlation between {numeric_cols[0]} and {numeric_cols[1]}",
+        })
+
+    if numeric_cols:
+        analyses.append({
+            "name": "Distribution Analysis",
+            "description": f"Understand the distribution of {numeric_cols[0]}",
+            "columns_needed": [numeric_cols[0]],
+            "formula_type": "distribution",
+            "example": f"What is the spread and average of {numeric_cols[0]}?",
+        })
+
+    # Category × numeric bar chart
+    if cat_cols and numeric_cols:
+        analyses.append({
+            "name": "Category Breakdown",
+            "description": f"Compare {numeric_cols[0]} across different {cat_cols[0]} groups",
+            "columns_needed": [cat_cols[0], numeric_cols[0]],
+            "formula_type": "aggregation",
+            "example": f"Which {cat_cols[0]} has the highest {numeric_cols[0]}?",
+        })
+        vizzes.append({
+            "chart_type": "bar",
+            "x_column": cat_cols[0],
+            "y_column": numeric_cols[0],
+            "reason": f"Bar chart to compare {numeric_cols[0]} by {cat_cols[0]}",
+        })
+        if len(cat_cols) >= 1 and len(numeric_cols) >= 2:
+            vizzes.append({
+                "chart_type": "bar",
+                "x_column": cat_cols[0],
+                "y_column": numeric_cols[1],
+                "reason": f"Bar chart to compare {numeric_cols[1]} by {cat_cols[0]}",
+            })
+
+    # Time series if date column present
+    if date_cols and numeric_cols:
+        analyses.append({
+            "name": "Trend Over Time",
+            "description": f"Track how {numeric_cols[0]} changes over {date_cols[0]}",
+            "columns_needed": [date_cols[0], numeric_cols[0]],
+            "formula_type": "time_series",
+            "example": f"Is {numeric_cols[0]} growing or declining over time?",
+        })
+        vizzes.append({
+            "chart_type": "line",
+            "x_column": date_cols[0],
+            "y_column": numeric_cols[0],
+            "reason": f"Line chart to show trend of {numeric_cols[0]} over {date_cols[0]}",
+        })
+
+    # Pie chart for category distribution
+    if cat_cols:
+        analyses.append({
+            "name": "Category Distribution",
+            "description": f"Show the proportion of each {cat_cols[0]} group",
+            "columns_needed": [cat_cols[0]],
+            "formula_type": "distribution",
+            "example": f"What percentage does each {cat_cols[0]} represent?",
+        })
+        vizzes.append({
+            "chart_type": "pie",
+            "x_column": cat_cols[0],
+            "y_column": numeric_cols[0] if numeric_cols else cat_cols[0],
+            "reason": f"Pie chart showing distribution across {cat_cols[0]}",
+        })
+
+    # Fallback if no suggestions generated
+    if not analyses:
+        first_col = columns[0] if columns else "column"
+        second_col = columns[1] if len(columns) > 1 else columns[0]
+        analyses.append({
+            "name": "Summary Statistics",
+            "description": f"Compute summary statistics across all columns",
+            "columns_needed": columns[:2],
+            "formula_type": "summary",
+            "example": "Mean, median, min, max for all numeric columns",
+        })
+        vizzes.append({
+            "chart_type": "bar",
+            "x_column": first_col,
+            "y_column": second_col,
+            "reason": f"Bar chart comparing {first_col} and {second_col}",
+        })
+
+    return {"suggested_analyses": analyses, "recommended_visualizations": vizzes}
+
+
+def suggest_analyses_and_viz(
+    columns: list[str],
+    sample_rows: list[dict],
+    filename: str,
+    df=None,
+) -> dict:
+    """
+    Generate suggested_analyses and recommended_visualizations for the
+    formula-suggestions endpoint. Tries GPT first, falls back to deterministic.
+    """
+    sample_text = json.dumps(sample_rows[:5], default=str, indent=2)
+    columns_text = ", ".join(f'"{c}"' for c in columns)
+
+    prompt = f"""You are a data analytics advisor. Given a dataset, suggest 4-6 analyses and 3-5 chart recommendations.
+
+File: "{filename}"
+Columns: [{columns_text}]
+Sample data (first 5 rows):
+{sample_text}
+
+Return ONLY this JSON (no other text):
+{{
+  "suggested_analyses": [
+    {{
+      "name": "Short analysis name",
+      "description": "One sentence describing the analysis",
+      "columns_needed": ["col1", "col2"],
+      "formula_type": "correlation|aggregation|distribution|time_series|comparison",
+      "example": "Example question this answers"
+    }}
+  ],
+  "recommended_visualizations": [
+    {{
+      "chart_type": "bar|line|scatter|pie",
+      "x_column": "exact_column_name",
+      "y_column": "exact_column_name",
+      "reason": "Why this chart is useful"
+    }}
+  ]
+}}
+
+Rules:
+- x_column and y_column MUST be exact column names from the list above
+- Suggest charts that reveal the most insight from this specific data
+- For pie charts, x_column = category column, y_column = numeric column
+- For line charts, x_column should be a date/time or sequential column
+- For bar/scatter, pick the most meaningful numeric vs category pairing"""
+
+    try:
+        response = _client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1500,
+        )
+        result = _parse_json_from_response(response.choices[0].message.content)
+        if result.get("suggested_analyses") or result.get("recommended_visualizations"):
+            return result
+    except Exception:
+        pass
+
+    # Fallback to deterministic logic
+    if df is not None:
+        return _build_suggestions_deterministically(columns, df)
+
+    # Last resort: minimal fallback
+    return {
+        "suggested_analyses": [
+            {
+                "name": "Summary Statistics",
+                "description": "Overview of key statistics across all columns",
+                "columns_needed": columns[:2],
+                "formula_type": "summary",
+                "example": "Mean, median and distribution of numeric columns",
+            }
+        ],
+        "recommended_visualizations": [
+            {
+                "chart_type": "bar",
+                "x_column": columns[0] if columns else "",
+                "y_column": columns[1] if len(columns) > 1 else columns[0] if columns else "",
+                "reason": "Initial overview of the dataset",
+            }
+        ],
+    }
+
+
 def suggest_formulas(
     columns: list[str],
     sample_rows: list[dict],

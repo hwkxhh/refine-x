@@ -16,7 +16,7 @@ from app.schemas.ai_charts import (
     AnnotationResponse,
     InsightResponse,
 )
-from app.services.ai_insights import generate_chart_insight
+from app.services.ai_insights import generate_chart_insight, _generate_fallback_insight
 from app.services.auth import get_current_user
 from app.services.cache import get_cached_dataframe
 
@@ -59,15 +59,13 @@ def generate_insight(
             user_goal=user_goal,
         )
     except (RateLimitError, AuthenticationError, APIStatusError):
-        result = {
-            "insight": (
-                f"AI insight unavailable (OpenAI quota exceeded). "
-                f"Chart shows {chart.chart_type} of {chart.x_header} vs {chart.y_header}."
-            ),
-            "confidence": "low",
-            "confidence_score": 0.0,
-            "recommendations": [],
-        }
+        result = _generate_fallback_insight(
+            chart_type=chart.chart_type,
+            x_header=chart.x_header,
+            y_header=chart.y_header,
+            chart_data=chart.data or [],
+            user_goal=user_goal,
+        )
 
     insight = Insight(
         chart_id=chart_id,

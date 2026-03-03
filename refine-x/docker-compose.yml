@@ -8,9 +8,9 @@ services:
     environment:
       POSTGRES_DB: refinex_db
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
+      POSTGRES_PASSWORD: refinex2026
     ports:
-      - "5432:5432"
+      - "5433:5432"  # 5433 avoids conflict with any local PostgreSQL on 5432
     volumes:
       - postgres_data:/var/lib/postgresql/data
 

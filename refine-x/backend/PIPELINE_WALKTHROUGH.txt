@@ -1,0 +1,370 @@
+================================================================================
+  REFINEX — END-TO-END CSV UPLOAD PIPELINE WALKTHROUGH
+================================================================================
+
+
+--------------------------------------------------------------------------------
+STEP 1 — FILE RECEPTION & STORAGE
+--------------------------------------------------------------------------------
+Function : upload_file()
+File     : app/routes/upload.py
+
+This is a synchronous FastAPI endpoint (POST /upload). It does three things
+in sequence before returning:
+
+  1. storage_service.validate_file()  [app/services/storage.py]
+     - Checks extension (.csv, .xlsx, .xls)
+     - Enforces 50MB max size
+     - Returns a 400 immediately if invalid
+
+  2. Writes an UploadJob record to PostgreSQL with status="pending"
+     - Captures filename, file_size, file_type, user_id
+     - The job gets a primary key ID before the file is even stored
+
+  3. storage_service.upload_file()  [app/services/storage.py]
+     - Streams the file into MinIO (S3-compatible)
+     - Stored at key: uploads/{job_id}/{filename}
+     - file_path saved as: s3://{bucket}/uploads/{job_id}/{filename}
+
+After that, it fires: process_csv_file.delay(job_id)
+  - Non-blocking Celery dispatch
+  - HTTP response (UploadJobResponse, 201) returns to the frontend IMMEDIATELY
+  - Frontend is expected to poll status
+
+
+--------------------------------------------------------------------------------
+STEP 2 — BACKGROUND CELERY TASK STARTS
+--------------------------------------------------------------------------------
+Function : process_csv_file()
+File     : app/tasks/process_csv.py
+
+This is the entire pipeline — a single Celery task. First actions:
+  - Opens its own DB session via SessionLocal()
+  - Sets job.status = "processing" and commits
+  - Downloads raw bytes from MinIO via storage_service.download_file()
+  - Loads into a pandas DataFrame with automatic:
+      * Delimiter detection (sep=None, engine="python")
+      * Encoding fallback (UTF-8 → latin-1)
+      * Excel multi-sheet: picks sheet with most rows, flags EXCEL_MULTI_SHEET
+        if > 1 sheet exists
+      * Headerless detection: if >= 70% of column names are numeric,
+        re-reads with header=None and generates col_0, col_1, ...
+
+
+--------------------------------------------------------------------------------
+STEP 3 — SESSION 1: GLOBAL RULES
+--------------------------------------------------------------------------------
+Function : GlobalRules.run_all()
+File     : app/services/global_rules.py
+
+Runs on the RAW DataFrame before any HTYPE-aware cleaning.
+Handles cell/column/row-level hygiene:
+  - Whitespace trimming
+  - Encoding artifact removal
+  - Column name normalization (GLOBAL-03)
+  - Empty row/column removal
+  - GLOBAL-10 PII pre-tagging → produces pii_tags {col_name: {level, label}}
+
+Outputs:
+  - Mutated df
+  - global_flags list (pending-review items for frontend)
+  - pii_tags dict
+
+
+--------------------------------------------------------------------------------
+STEP 4 — SESSION 2: STRUCT RULES
+--------------------------------------------------------------------------------
+Function : StructRules.run_all()
+File     : app/services/struct_rules.py
+
+Fixes macro-level structural problems:
+  - Header row offset detection
+  - Group-label forward-fill (merged cells in Excel)
+  - Wide/transposed layout detection
+
+Excel multi-sheet flags from Step 2 are prepended to struct_flags.
+
+Outputs:
+  - Structurally-corrected df
+  - struct_flags list
+
+
+--------------------------------------------------------------------------------
+STEP 4.5 — COLUMN RELEVANCE GATE  (NEW — pipeline pauses here)
+--------------------------------------------------------------------------------
+Function : evaluate_column_relevance()
+File     : app/services/column_relevance.py
+Triggered: Inline within process_csv_file() — Phase 1
+
+A SINGLE GPT-4o call that receives:
+  - All column names
+  - First 5 rows as sample data
+  - The original filename
+
+GPT-4o evaluates each column and returns:
+  {
+    "overall_verdict": "useful" | "not_useful",
+    "reason": "short explanation",
+    "columns": [
+      {"name": "col_name", "recommendation": "keep" | "remove", "reason": "why"}
+    ]
+  }
+
+After the call returns:
+  - UploadJob.column_relevance_result is saved (JSON)
+  - UploadJob.status is set to "awaiting_review"
+  - The Celery task (Phase 1) ENDS — no cleaning runs yet
+
+The frontend detects status="awaiting_review" via GET /upload/jobs/{id}/status
+and displays the column relevance payload for the user to confirm.
+
+If the GPT call fails, all columns default to "keep" and the gate still pauses.
+
+Resume:
+  The user submits POST /upload/jobs/{id}/review with
+  { "confirmed_columns": ["col_a", "col_b", ...] }
+  → This saves confirmed_columns to UploadJob
+  → Dispatches resume_pipeline_after_review.delay(job_id)
+  → Phase 2 Celery task runs Steps 5+ with only the confirmed columns
+
+
+--------------------------------------------------------------------------------
+STEP 5 — STAGE 1+2: AI CLASSIFICATION (GPT-4o)
+--------------------------------------------------------------------------------
+Function : classify_and_assign()
+File     : app/services/ai_analysis.py
+
+A SINGLE GPT-4o call that receives:
+  - All column names
+  - First 5 rows as sample data
+  - The original filename
+
+Returns per-column:
+  - HTYPE code
+  - Confidence score (0.0 – 1.0)
+  - List of formula IDs to apply (Stage 2)
+
+If the call fails for any reason (timeout, API error), this step is silently
+skipped and the system falls back entirely to the deterministic detector
+in Step 6.
+
+
+--------------------------------------------------------------------------------
+STEP 6 — SESSION 3: HTYPE DETECTOR (DETERMINISTIC FALLBACK)
+--------------------------------------------------------------------------------
+Function : HtypeDetector.get_detection_report()
+File     : app/services/htype_detector.py
+
+Runs on EVERY column, independent of the AI result.
+Detection priority chain:
+  1. Exact column name match against HTYPE_REGISTRY keywords
+  2. Partial keyword match in column name
+  3. Value pattern regex analysis
+  4. Data distribution analysis
+
+Covers all 47 HTYPE codes (HTYPE-000 through HTYPE-047).
+This is the source of truth when AI confidence is insufficient.
+
+
+--------------------------------------------------------------------------------
+STEP 7 — TIERED CONFIDENCE MERGE
+--------------------------------------------------------------------------------
+Location : Inline logic in process_csv_file()
+File     : app/tasks/process_csv.py
+
+AI result and deterministic result are merged using three tiers:
+
+  >= 0.85 confidence  →  AI classification wins automatically
+  0.60 – 0.84        →  If AI and HtypeDetector AGREE → use it
+                         If AI and HtypeDetector DISAGREE → flag as
+                         HTYPE_CLASSIFICATION_CONFLICT (PendingReview),
+                         keep HtypeDetector result
+  < 0.60             →  Always flag HTYPE_CLASSIFICATION_LOW_CONFIDENCE
+                         (PendingReview), keep HtypeDetector result
+
+Final htype_map = {col_name: htype_code}
+This map is passed to every downstream session.
+
+
+--------------------------------------------------------------------------------
+STEP 8 — SESSIONS 4–10, 12–13, 15–16: HTYPE-SPECIFIC CLEANING
+--------------------------------------------------------------------------------
+Each runner receives the current df and htype_map, mutates df, and emits
+its own flags list. They run in strict order, each feeding the output of
+the previous.
+
+  Session  Runner                         File                              HTYPEs
+  ──────── ─────────────────────────────  ────────────────────────────────  ────────────────────────────────────
+  4        PersonalIdentityRules.run_all  personal_identity_rules.py        FNAME, SNAME, UID, AGE, GEN
+  5        DateTimeRules.run_all          date_time_rules.py                DATE, TIME, DTM, DUR, FISC
+  6        ContactLocationRules.run_all   contact_location_rules.py         PHONE, EMAIL, ADDR, CITY, CNTRY, POST, GEO
+  7        NumericFinancialRules.run_all  numeric_financial_rules.py        AMT, QTY, PCT, SCORE, CUR, RANK, CALC
+  8        BooleanCategoryRules.run_all   boolean_category_rules.py         BOOL, CAT, STAT, SURV, MULTI
+  9        OrgProductRules.run_all        org_product_rules.py              PROD, SKU, ORG, JOB, DEPT, REFNO, VER
+  10       TextTechnicalRules.run_all     text_technical_rules.py           TEXT, URL, IP, FILE
+  12       MissingValueMatrix.run_all     missing_value_matrix.py           All columns — auto-fill, suggest, prompt
+  13       DuplicateResolution.run_all    duplicate_resolution.py           Exact (auto-removed), partial/fuzzy/temporal (flagged)
+  15       ConditionalValidation.run_all  conditional_validation.py         Cross-column: date sequences, age-DOB, status-date, sum checks
+  16       MedicalRules.run_all           medical_rules.py                  DIAG (HIGH-SENSITIVITY PII, ICD), PHYS (BMI, unit conversion)
+
+
+--------------------------------------------------------------------------------
+STEP 9 — DATACLEANING PIPELINE: FINAL GENERIC PASS
+--------------------------------------------------------------------------------
+Function : DataCleaningPipeline.run_all()
+File     : app/services/cleaning.py
+
+A 4-phase post-HTYPE pass that is HTYPE-agnostic:
+
+  Phase 1 (Structural)     : remove_duplicates, normalize_column_names,
+                             remove_empty_columns
+  Phase 2 (Standardisation): detect_and_convert_dates, detect_and_bucket_ages
+  Phase 3 (Missing data)   : identify_missing_values, auto_fill_numeric,
+                             auto_fill_categorical
+  Phase 4 (Outliers)       : detect_outliers_iqr
+
+Every individual change is written as a CleaningLog row in PostgreSQL:
+  columns: job_id, action, reason, column_name, row_index, original_value,
+           new_value, formula_id, was_auto_applied, timestamp
+
+
+--------------------------------------------------------------------------------
+STEP 10 — QUALITY SCORE
+--------------------------------------------------------------------------------
+Function : calculate_quality_score()
+File     : app/services/quality.py
+
+Runs on the final cleaned_df. Composite 0–100 score:
+
+  Completeness  40%  —  % of non-null cells
+  Uniqueness    30%  —  % of non-duplicate rows vs original count
+  Consistency   20%  —  % of columns with uniform inferred dtype
+  Integrity     10%  —  penalises remaining null cells after cleaning
+
+  score = completeness*0.40 + uniqueness*0.30 + consistency*0.20 + integrity*0.10
+
+
+--------------------------------------------------------------------------------
+STEP 11 — SESSION 14: ANALYTICAL FORMULAS  (AUTOMATIC)
+--------------------------------------------------------------------------------
+Function : AnalyticalFormulas.run_all()
+File     : app/services/analytical_formulas.py
+
+AUTOMATIC and UNCONDITIONAL — always runs after cleaning.
+Formula IDs: AN-01 through AN-20
+Produces: trends, correlations, distributions, forecasts, derived metrics.
+Results stored as analytical_results (JSON) and drive chart rendering
+on the frontend.
+
+
+--------------------------------------------------------------------------------
+STEP 12 — WHAT GETS PERSISTED & WHEN
+--------------------------------------------------------------------------------
+
+Three writes happen, all committed together in a single db.commit():
+
+  1. CleanedDataset row (PostgreSQL)  [app/models/cleaned_dataset.py]
+     The single most important DB write. Contains:
+       - column_metadata     {col: {dtype, null_count, unique_count, sample}}
+       - htype_map           {col: htype_code}
+       - pii_tags            {col: {level, label}}
+       - ai_formulas         {col: [formula_ids]}
+       - global_flags        (Session 1 pending-review items)
+       - struct_flags        (Session 2 pending-review items)
+       - ai_classification_flags  (confidence conflict/low items)
+       - personal_identity_flags  (Session 4)
+       - date_time_flags          (Session 5)
+       - contact_location_flags   (Session 6)
+       - numeric_financial_flags  (Session 7)
+       - boolean_category_flags   (Session 8)
+       - org_product_flags        (Session 9)
+       - text_technical_flags     (Session 10)
+       - missing_value_flags      (Session 12)
+       - duplicate_flags          (Session 13)
+       - analytical_results       (Session 14)
+       - conditional_flags        (Session 15)
+       - medical_flags            (Session 16)
+       - cleaning_summary, quality_score, row counts
+
+  2. Redis cache  [app/services/cache.py]
+     cache_dataframe(job_id, cleaned_df)
+       - Key   : cleaned_df:{job_id}
+       - Value : full cleaned DataFrame serialized as JSON
+       - TTL   : 1 hour
+     This is what downstream chart/export routes read without
+     re-running the pipeline.
+
+  3. UploadJob updated (PostgreSQL)  [app/models/upload_job.py]
+       - status       = "completed"
+       - row_count    = len(cleaned_df)
+       - column_count = len(cleaned_df.columns)
+       - quality_score
+       - processed_at = datetime.utcnow()
+
+  On ANY exception:
+       - db.rollback()
+       - job.status = "failed"
+       - job.error_message = str(e)  (committed separately)
+
+
+--------------------------------------------------------------------------------
+STEP 13 — WHAT THE FRONTEND RECEIVES
+--------------------------------------------------------------------------------
+
+Upload response (immediate, at upload time):
+  POST /upload  →  UploadJobResponse (HTTP 201)
+  {
+    "id": 42,
+    "filename": "data.csv",
+    "status": "pending",
+    "quality_score": null,
+    "row_count": null,
+    ...
+  }
+
+Status polling (frontend polls until status == "completed"):
+  GET /upload/jobs/{job_id}/status  →  JobStatusResponse
+  {
+    "job_id": 42,
+    "status": "completed",
+    "progress": 100,
+    "quality_score": 87.4,
+    "row_count": 1200
+  }
+
+  Progress map: pending=0, processing=50, completed=100, failed=0
+
+Once completed, the frontend fetches:
+  - Full job details : GET /upload/jobs/{job_id}
+  - Cleaning data   : GET /cleaning/...   (reads CleanedDataset from DB)
+  - Charts          : GET /charts/...     (reads from Redis cache)
+
+
+--------------------------------------------------------------------------------
+MODIFICATION RISK MAP
+--------------------------------------------------------------------------------
+
+  What you want to change              Where to touch
+  ────────────────────────────────── ─────────────────────────────────────────
+  Column Relevance Gate logic         app/services/column_relevance.py  AND
+                                      Phase 1 block in process_csv.py
+
+  Review endpoint / user flow         app/routes/upload.py (POST /review)
+
+  HTYPE classification logic          app/services/ai_analysis.py  AND
+                                      app/services/htype_detector.py  AND
+                                      tiered merge block in process_csv.py
+
+  A specific cleaning rule set        One runner file only (e.g. date_time_rules.py)
+  (e.g. date cleaning)
+
+  What gets persisted to DB           app/models/cleaned_dataset.py  AND
+                                      CleanedDataset(...) block in process_csv.py
+
+  Quality scoring formula             app/services/quality.py
+
+  File storage / MinIO logic          app/services/storage.py
+
+  Analytics / charting output         app/services/analytical_formulas.py
+
+================================================================================

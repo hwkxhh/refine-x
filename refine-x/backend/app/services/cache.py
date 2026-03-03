@@ -25,7 +25,11 @@ def get_cached_dataframe(job_id: int) -> pd.DataFrame | None:
     raw = _client.get(_key(job_id))
     if raw is None:
         return None
-    return pd.read_json(io.StringIO(raw), orient="records")
+    df = pd.read_json(io.StringIO(raw), orient="records")
+    # pd.read_json converts numeric-looking column names (e.g. "0", "1") back
+    # to numpy.int64 — normalise to plain str so all downstream .lower() calls work.
+    df.columns = [str(c) for c in df.columns]
+    return df
 
 
 def delete_cached_dataframe(job_id: int) -> None:

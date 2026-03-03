@@ -6,10 +6,15 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.upload_job import UploadJob
 from app.models.user import User
-from app.schemas.upload import UploadJobResponse, UploadJobListResponse, JobStatusResponse
+from app.schemas.upload import (
+    UploadJobResponse,
+    UploadJobListResponse,
+    JobStatusResponse,
+    ColumnReviewRequest,
+)
 from app.services.auth import get_current_user
 from app.services.storage import storage_service
-from app.tasks.process_csv import process_csv_file
+from app.tasks.process_csv import process_csv_file, resume_pipeline_after_review
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
@@ -94,7 +99,13 @@ def get_job_status(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    progress_map = {"pending": 0, "processing": 50, "completed": 100, "failed": 0}
+    progress_map = {
+        "pending": 0,
+        "processing": 25,
+        "awaiting_review": 30,
+        "completed": 100,
+        "failed": 0,
+    }
 
     return JobStatusResponse(
         job_id=job.id,
@@ -103,6 +114,7 @@ def get_job_status(
         quality_score=job.quality_score,
         row_count=job.row_count,
         error_message=job.error_message,
+        column_relevance_result=job.column_relevance_result,
     )
 
 
@@ -125,3 +137,36 @@ def delete_job(
     db.delete(job)
     db.commit()
     return {"message": "Job deleted successfully"}
+
+
+@router.post("/jobs/{job_id}/review", response_model=UploadJobResponse)
+def review_columns(
+    job_id: int,
+    body: ColumnReviewRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Accept the user's column selection and resume the cleaning pipeline."""
+    job = db.query(UploadJob).filter(
+        UploadJob.id == job_id, UploadJob.user_id == current_user.id
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != "awaiting_review":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is not awaiting review (current status: {job.status})",
+        )
+
+    if not body.confirmed_columns:
+        raise HTTPException(status_code=400, detail="confirmed_columns must not be empty")
+
+    # Persist the user's choice and kick off Phase 2
+    job.confirmed_columns = body.confirmed_columns
+    db.commit()
+    db.refresh(job)
+
+    resume_pipeline_after_review.delay(job.id)
+
+    return job

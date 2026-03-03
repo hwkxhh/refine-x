@@ -13,7 +13,7 @@ from app.schemas.ai_charts import (
     FormulaSuggestionsResponse,
     HeaderAnalysisResponse,
 )
-from app.services.ai_analysis import analyze_headers, suggest_formulas
+from app.services.ai_analysis import analyze_headers, suggest_formulas, suggest_analyses_and_viz
 from app.services.auth import get_current_user
 from app.services.cache import cache_dataframe, get_cached_dataframe
 from datetime import datetime
@@ -58,10 +58,11 @@ def analyze_job_headers(
     df = _get_df_or_422(job_id)
 
     sample_rows = df.head(5).fillna("").to_dict(orient="records")
+    columns = [str(c) for c in df.columns.tolist()]
 
     try:
         result = analyze_headers(
-            columns=df.columns.tolist(),
+            columns=columns,
             sample_rows=sample_rows,
             filename=job.filename,
         )
@@ -182,24 +183,17 @@ def formula_suggestions(
         dataset_summary = cleaned.cleaning_summary.get("dataset_summary")
 
     sample_rows = df.head(5).fillna("").to_dict(orient="records")
+    columns = [str(c) for c in df.columns.tolist()]
 
-    try:
-        result = suggest_formulas(
-            columns=df.columns.tolist(),
-            sample_rows=sample_rows,
-            filename=job.filename,
-            dataset_summary=dataset_summary,
-        )
-    except (RateLimitError, AuthenticationError, APIStatusError):
-        # GPT unavailable — return empty suggestions with graceful message
-        return FormulaSuggestionsResponse(
-            job_id=job_id,
-            suggested_analyses=[],
-            recommended_visualizations=[],
-        )
+    result = suggest_analyses_and_viz(
+        columns=columns,
+        sample_rows=sample_rows,
+        filename=job.filename,
+        df=df,
+    )
 
     return FormulaSuggestionsResponse(
         job_id=job_id,
-        suggested_analyses=result.get("suggested_analyses", []),
-        recommended_visualizations=result.get("recommended_visualizations", []),
+        suggested_analyses=result["suggested_analyses"],
+        recommended_visualizations=result["recommended_visualizations"],
     )

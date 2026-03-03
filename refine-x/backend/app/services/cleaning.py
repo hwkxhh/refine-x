@@ -245,7 +245,7 @@ class DataCleaningPipeline:
                 new_value=str(round(fill_value, 4)),
             )
 
-        self.df[column].fillna(fill_value, inplace=True)
+        self.df[column] = self.df[column].fillna(fill_value)
         self.summary["missing_filled"] += count
         self.db.flush()
         return count
@@ -273,7 +273,7 @@ class DataCleaningPipeline:
                 new_value=str(fill_value),
             )
 
-        self.df[column].fillna(fill_value, inplace=True)
+        self.df[column] = self.df[column].fillna(fill_value)
         self.summary["missing_filled"] += count
         self.db.flush()
         return count

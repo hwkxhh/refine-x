@@ -1,0 +1,1072 @@
+╔══════════════════════════════════════════════════════════════════════════╗
+║          REFINEX — FRONTEND ↔ BACKEND CONNECTION ANALYSIS              ║
+║          Full Codebase Understanding & Integration Blueprint            ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+Generated after reading every file in both codebases.
+
+═══════════════════════════════════════════════════════════════════════════
+PART 1: WHAT THE BACKEND DOES (Complete Picture)
+═══════════════════════════════════════════════════════════════════════════
+
+Stack: FastAPI · Celery · PostgreSQL · Redis · MinIO (S3) · OpenAI GPT-4o
+Runs on: http://localhost:8000
+CORS: Already allows http://localhost:3000 (the frontend)
+
+The backend is FULLY BUILT. It exposes 40 REST endpoints across 7 routers:
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ROUTER 1: AUTH (/auth)                                                 │
+│ ─────────────────────────────────────                                  │
+│ POST /auth/register    → Create user (name, email, password)           │
+│                           Returns: { id, name, email, created_at }     │
+│                                                                        │
+│ POST /auth/login       → OAuth2 form login (username=email, password)  │
+│                           Returns: { access_token, token_type }        │
+│                           NOTE: Uses OAuth2PasswordRequestForm,        │
+│                           so body must be form-encoded, NOT JSON.      │
+│                                                                        │
+│ GET  /auth/me          → Get current user from JWT token               │
+│                           Header: Authorization: Bearer <token>        │
+│                           Returns: { id, name, email, created_at }     │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ROUTER 2: UPLOAD (/upload)                                             │
+│ ─────────────────────────────────────                                  │
+│ POST /upload           → Upload CSV/XLSX file (multipart/form-data)    │
+│                           Auth required. Max 50MB.                     │
+│                           Creates UploadJob, stores in MinIO,          │
+│                           fires Celery task (Phase 1).                 │
+│                           Returns: UploadJobResponse                   │
+│                                                                        │
+│ GET  /upload/jobs      → List all jobs for authenticated user          │
+│                           Returns: [{ id, filename, status,            │
+│                                       quality_score, created_at }]     │
+│                                                                        │
+│ GET  /upload/jobs/{id} → Get full job details                          │
+│                           Returns: UploadJobResponse (all fields)      │
+│                                                                        │
+│ GET  /upload/jobs/{id}/status → Polling endpoint for progress          │
+│                           Returns: { job_id, status, progress (0-100), │
+│                                      quality_score, row_count,         │
+│                                      error_message,                    │
+│                                      column_relevance_result }         │
+│                           Status values: pending, processing,          │
+│                                          awaiting_review, completed,   │
+│                                          failed                        │
+│                                                                        │
+│ DELETE /upload/jobs/{id} → Delete job + file from MinIO                │
+│                                                                        │
+│ POST /upload/jobs/{id}/review → Submit column review                   │
+│                           Body: { confirmed_columns: ["col1","col2"] } │
+│                           Resumes Phase 2 of the pipeline.             │
+│                           Returns: UploadJobResponse                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ROUTER 3: CLEANING (/jobs)                                             │
+│ ─────────────────────────────────────                                  │
+│ GET  /jobs/{id}/cleaning-summary → Rows before/after, duplicates       │
+│                                    removed, columns renamed, quality   │
+│                                    score, column metadata (dtype,      │
+│                                    nulls, uniques per column)          │
+│                                                                        │
+│ GET  /jobs/{id}/audit-trail     → Paginated log of every cleaning      │
+│                                    action (row, col, action, before,   │
+│                                    after, formula_id, auto/manual)     │
+│                                                                        │
+│ GET  /jobs/{id}/missing-fields  → Columns with nulls + AI-suggested    │
+│                                    fill strategies (median/mode/ffill) │
+│                                                                        │
+│ POST /jobs/{id}/fill-missing    → Manually fill cells                  │
+│                                    Body: { column, row_indices, values }│
+│                                                                        │
+│ GET  /jobs/{id}/outliers        → Flagged outlier rows with expected   │
+│                                    ranges                              │
+│                                                                        │
+│ POST /jobs/{id}/resolve-outlier → Keep or remove an outlier            │
+│                                    Body: { row_index, action }         │
+│                                                                        │
+│ GET  /jobs/{id}/export          → Download cleaned CSV as file         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ROUTER 4: AI ANALYSIS (/jobs)                                          │
+│ ─────────────────────────────────────                                  │
+│ GET  /jobs/{id}/analyze-headers → AI reviews all columns → marks       │
+│                                    unnecessary vs essential             │
+│                                                                        │
+│ POST /jobs/{id}/drop-columns    → Remove selected columns from dataset │
+│                                    Body: { columns: ["col1","col2"] }  │
+│                                                                        │
+│ GET  /jobs/{id}/formula-suggestions → AI suggests calculations &       │
+│                                       chart pairings for the data      │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ROUTER 5: CHARTS (/jobs)                                               │
+│ ─────────────────────────────────────                                  │
+│ POST /jobs/{id}/goal            → Set analysis goal (text + category)  │
+│ GET  /jobs/{id}/goal            → Get the goal                         │
+│ GET  /jobs/{id}/recommendations → AI chart recommendations based on    │
+│                                    goal + data shape                   │
+│ POST /jobs/{id}/charts          → Generate a chart (x_col, y_col)      │
+│ GET  /jobs/{id}/charts          → List all charts for a job            │
+│ GET  /jobs/{id}/charts/{cid}    → Get single chart with data           │
+│ DELETE /jobs/{id}/charts/{cid}  → Delete a chart                       │
+│ GET  /jobs/{id}/correlation     → Generate correlation heatmap         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ROUTER 6: INSIGHTS & ANNOTATIONS                                       │
+│ ─────────────────────────────────────                                  │
+│ POST /jobs/{id}/charts/{cid}/insight → AI generates text insight for   │
+│                                        a chart (with confidence score) │
+│ GET  /jobs/{id}/insights        → All insights for a job               │
+│ GET  /insights/{iid}            → Get single insight                   │
+│ POST /jobs/{id}/charts/{cid}/annotations → Add annotation to data pt  │
+│ GET  /jobs/{id}/charts/{cid}/annotations → List annotations            │
+│ DELETE /annotations/{aid}       → Delete own annotation                │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ROUTER 7: COMPARISON (/compare)                                        │
+│ ─────────────────────────────────────                                  │
+│ POST /compare                   → Compare two jobs (fuzzy header match)│
+│ POST /compare/{id}/confirm-mapping → Confirm column mapping → compute  │
+│                                      deltas                            │
+│ GET  /compare/{id}/deltas       → Raw delta values                     │
+│ GET  /compare/{id}/significant-changes → Significant changes only      │
+│ POST /compare/{id}/insights     → AI narrative about comparison        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+DATABASE MODELS (9 tables):
+  • users              — id, email, password_hash, name, created_at
+  • upload_jobs         — id, user_id, filename, file_path, status,
+                          column_relevance_result (JSON), confirmed_columns (JSON),
+                          quality_score, row_count, column_count, ...
+  • cleaned_datasets    — id, job_id (1:1), column_metadata (JSON), 16+ JSON
+                          flag columns (one per cleaning session), analytical_results
+  • cleaning_logs       — id, job_id, row/col, action, before/after, formula_id
+  • user_goals          — id, job_id (1:1), goal_text, goal_category
+  • charts              — id, job_id, chart_type, x/y headers, data (JSON),
+                          config (JSON), is_recommended
+  • insights            — id, chart_id, job_id, content, confidence,
+                          confidence_score, recommendations (JSON)
+  • annotations         — id, chart_id, user_id, data_point_index, text
+  • comparison_jobs     — id, user_id, job_id_1, job_id_2, deltas (JSON),
+                          significant_changes (JSON), ai_insight
+
+PIPELINE (Celery background processing):
+  Phase 1 (process_csv_file):
+    Load CSV → Global Rules → Struct Rules → Column Relevance Gate (GPT-4o)
+    → status = "awaiting_review" → STOP (waits for user column confirmation)
+
+  Phase 2 (resume_pipeline_after_review):
+    Replay Steps 1-4 → Apply column filter → AI Classification → HTYPE
+    Detection → Tiered Merge → Sessions 4-16 cleaning → Quality Score
+    → Analytical Formulas → Persist → status = "completed"
+
+AUTH MECHANISM:
+  JWT Bearer tokens. Every protected endpoint requires:
+    Authorization: Bearer <access_token>
+  Token created by POST /auth/login, validated by get_current_user dependency.
+  Token payload: { sub: "<user_id>" }
+  Expiry: 30 minutes (configurable via ACCESS_TOKEN_EXPIRE_MINUTES)
+
+
+═══════════════════════════════════════════════════════════════════════════
+PART 2: WHAT THE FRONTEND DOES (Complete Picture)
+═══════════════════════════════════════════════════════════════════════════
+
+Stack: Next.js 16.1.6 · React 19.2.3 · TypeScript · Tailwind CSS v4
+       Framer Motion · Recharts · Lucide React
+Runs on: http://localhost:3000
+
+The frontend is a COMPLETE UI PROTOTYPE — every page is built and styled,
+but uses 100% HARDCODED MOCK DATA with no real API calls anywhere.
+
+ROUTE MAP:
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PUBLIC PAGES (uses PageLayout = Header + Footer)                       │
+│ ─────────────────────────────────────                                  │
+│ /                          → Landing page (hero, features, CTA)        │
+│ /how-it-works              → How it works marketing page               │
+│ /features                  → Feature showcase                          │
+│ /use-cases                 → Industry use cases                        │
+│ /pricing                   → Pricing tiers                             │
+│ /blog                      → Blog listing                              │
+│ /about                     → About page                                │
+│ /contact                   → Contact form                              │
+│                                                                        │
+│ AUTH PAGES (standalone layouts)                                         │
+│ ─────────────────────────────────────                                  │
+│ /auth/login                → Email + password login form               │
+│                              MOCK: setTimeout 1.5s → redirect          │
+│                                                                        │
+│ /auth/signup               → Name + email + password form              │
+│                              MOCK: setTimeout 2s → redirect            │
+│                                                                        │
+│ /auth/onboarding           → 3-step wizard:                            │
+│                              1. Org type + team size                   │
+│                              2. Workspace name + goal                  │
+│                              3. Upload first file                      │
+│                              MOCK: setTimeout 1s → redirect            │
+│                                                                        │
+│ /auth/forgot-password      → Email input + send reset link             │
+│                              MOCK: No submit handler at all            │
+│                                                                        │
+│ DASHBOARD PAGES (uses DashboardLayout = Sidebar + DashboardHeader)     │
+│ ─────────────────────────────────────                                  │
+│ /dashboard                 → Home dashboard                            │
+│                              MOCK: All data hardcoded inline           │
+│                              Shows: recent analyses, insights, charts, │
+│                              recommendations, username "John"          │
+│                                                                        │
+│ /dashboard/upload          → File upload page                          │
+│                              MOCK: handleFile() → setTimeout 2s        │
+│                              Shows mockCSVData preview, then redirects │
+│                              to /dashboard/project/new/profile         │
+│                                                                        │
+│ /dashboard/analyses        → List of analyses (server component)       │
+│                              MOCK: 3 inline hardcoded items            │
+│                                                                        │
+│ /dashboard/datasets        → List of cleaned datasets                  │
+│                              MOCK: 2 inline hardcoded items            │
+│                                                                        │
+│ /dashboard/insights        → AI-generated insights across all data     │
+│                              MOCK: 3 inline hardcoded items            │
+│                                                                        │
+│ /dashboard/visualizations  → Visualization studio / chart gallery      │
+│                              MOCK: 4 inline hardcoded items            │
+│                                                                        │
+│ /dashboard/projects        → Project card grid with search/filter      │
+│                              MOCK: mockProjects from lib/mock-data     │
+│                              CLIENT: Has searchQuery, statusFilter,    │
+│                              activeMenu state                          │
+│                                                                        │
+│ /dashboard/reports         → Report card grid with hover overlays      │
+│                              MOCK: 6 inline hardcoded items            │
+│                              CLIENT: Has searchQuery, statusFilter,    │
+│                              dateRange, activeMenu state               │
+│                                                                        │
+│ /dashboard/history         → Chronological audit log                   │
+│                              MOCK: 6 inline hardcoded items            │
+│                                                                        │
+│ /dashboard/settings        → Full account settings page                │
+│                              MOCK: Hardcoded "John Doe" defaults       │
+│                              CLIENT: Has saved state for success toast │
+│                                                                        │
+│ PROJECT NEW FLOW (4-step wizard):                                      │
+│ ─────────────────────────────────────                                  │
+│ /dashboard/project/new/profile   → Step 1: Column profiling review     │
+│                                    MOCK: mockColumnProfiles            │
+│                                    CLIENT: expandedColumn state        │
+│                                                                        │
+│ /dashboard/project/new/clean     → Step 2: Data cleaning + preview     │
+│                                    MOCK: mockCSVData                   │
+│                                    CLIENT: isAutoClean, isCleaning,    │
+│                                    showAfter, cleaningLog states       │
+│                                                                        │
+│ /dashboard/project/new/domain    → Step 3: AI domain detection         │
+│                                    MOCK: 6 hardcoded domains           │
+│                                    CLIENT: selectedDomain state        │
+│                                                                        │
+│ /dashboard/project/new/analytics → Step 4: Select analytics types      │
+│                                    MOCK: 6 hardcoded analytics         │
+│                                    CLIENT: selectedTypes, groupBy      │
+│                                                                        │
+│ PROJECT [ID] PAGES:                                                    │
+│ ─────────────────────────────────────                                  │
+│ /dashboard/project/:id/visualize → KPIs + 6+ interactive Recharts     │
+│                                    MOCK: mockChartData, mockCategory,  │
+│                                    mockRegion, topProducts, etc.       │
+│                                    CLIENT: chartViewType state         │
+│                                                                        │
+│ /dashboard/project/:id/insights  → Executive summary + key findings    │
+│                                    MOCK: mockInsights + hardcoded text │
+└─────────────────────────────────────────────────────────────────────────┘
+
+KEY COMPONENTS:
+  • Sidebar          → 8 nav links, active state via usePathname
+  • DashboardHeader  → Search bar, workspace dropdown ("Rider Payments"),
+                       "+ New Analysis" button, notifications bell,
+                       user menu ("John Doe / john@example.com")
+  • Header           → Public marketing navbar, scroll blur effect
+  • Footer           → Newsletter, 5-column link grid
+  • PageLayout       → Header + children + Footer wrapper
+  • UI components    → Button, Card, Input, Alert, Badge, Skeleton,
+                       EmptyState, AvatarSelector (all custom, no shadcn)
+
+MOCK DATA FILES (lib/mock-data/):
+  • csv-data.ts    → mockCSVData (headers, rows, stats), mockColumnProfiles
+  • projects.ts    → mockProjects array, mockTemplates, Project interface
+  • charts.ts      → mockChartData, mockCategoryData, mockRegionData,
+                     topProductsData, salespersonData, goalVsActualData,
+                     mockInsights
+
+UTILITIES (lib/utils.ts):
+  • cn()           → classnames merge (clsx + tailwind-merge)
+  • formatNumber() → locale-aware number formatting
+  • formatBytes()  → file size display
+  • formatDate()   → date formatting
+  • generateId()   → random ID generator
+
+WHAT DOES NOT EXIST YET:
+  ✗ No API client / HTTP wrapper (no fetch/axios calls anywhere)
+  ✗ No auth context / token storage / session management
+  ✗ No protected route middleware
+  ✗ No loading states tied to real async operations
+  ✗ No error handling for API failures
+  ✗ No real-time polling (status checks use fake setTimeout)
+  ✗ No environment variables for API URL
+  ✗ No TypeScript interfaces matching backend Pydantic schemas
+
+
+═══════════════════════════════════════════════════════════════════════════
+PART 3: HOW TO CONNECT THEM — DETAILED INTEGRATION PLAN
+═══════════════════════════════════════════════════════════════════════════
+
+OVERVIEW:
+  The frontend has ~20 pages that need to be wired to ~40 backend endpoints.
+  The integration requires building 5 foundational layers first, then
+  converting each page from mock data to real API calls.
+
+───────────────────────────────────────────────────────────────────────────
+LAYER 1: API CLIENT (create first, everything depends on it)
+───────────────────────────────────────────────────────────────────────────
+
+Create: lib/api/client.ts
+
+  Purpose: Centralized HTTP client that:
+    • Points to NEXT_PUBLIC_API_URL (default: http://localhost:8000)
+    • Automatically attaches Authorization: Bearer <token> header
+    • Handles 401 responses by redirecting to /auth/login
+    • Handles network errors gracefully
+    • Provides typed response parsing
+
+  Implementation approach:
+    const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+
+    async function apiClient<T>(
+      endpoint: string,
+      options?: RequestInit & { skipAuth?: boolean }
+    ): Promise<T> {
+      const token = typeof window !== "undefined"
+        ? localStorage.getItem("access_token") : null
+
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        ...options?.headers as Record<string, string>,
+      }
+
+      if (token && !options?.skipAuth) {
+        headers["Authorization"] = `Bearer ${token}`
+      }
+
+      const res = await fetch(`${API_URL}${endpoint}`, {
+        ...options,
+        headers,
+      })
+
+      if (res.status === 401) {
+        localStorage.removeItem("access_token")
+        window.location.href = "/auth/login"
+        throw new Error("Unauthorized")
+      }
+
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({ detail: "Unknown error" }))
+        throw new Error(error.detail || `HTTP ${res.status}`)
+      }
+
+      return res.json()
+    }
+
+  SPECIAL CASE — Login endpoint:
+    The backend uses OAuth2PasswordRequestForm, which expects
+    application/x-www-form-urlencoded body, NOT JSON.
+    The login function must use URLSearchParams:
+
+    async function login(email: string, password: string) {
+      const body = new URLSearchParams({ username: email, password })
+      const res = await fetch(`${API_URL}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+      })
+      // ... parse Token response
+    }
+
+  SPECIAL CASE — File upload:
+    The upload endpoint expects multipart/form-data with the file.
+    Must NOT set Content-Type header (let browser set boundary):
+
+    async function uploadFile(file: File) {
+      const formData = new FormData()
+      formData.append("file", file)
+      const token = localStorage.getItem("access_token")
+      const res = await fetch(`${API_URL}/upload`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      })
+      // ... parse UploadJobResponse
+    }
+
+───────────────────────────────────────────────────────────────────────────
+LAYER 2: TYPE DEFINITIONS (mirror backend Pydantic schemas)
+───────────────────────────────────────────────────────────────────────────
+
+Create: lib/api/types.ts
+
+  Every Pydantic schema in the backend needs a TypeScript interface:
+
+  // Auth
+  interface UserResponse { id: number; name: string|null; email: string; created_at: string }
+  interface Token { access_token: string; token_type: string }
+
+  // Upload/Jobs
+  interface UploadJobResponse {
+    id: number; filename: string; file_size: number; file_type: string;
+    status: "pending"|"processing"|"awaiting_review"|"completed"|"failed";
+    quality_score: number|null; row_count: number|null; column_count: number|null;
+    column_relevance_result: ColumnRelevanceResult|null;
+    confirmed_columns: string[]|null;
+    created_at: string; processed_at: string|null;
+  }
+  interface JobStatusResponse {
+    job_id: number; status: string; progress: number;
+    quality_score: number|null; row_count: number|null;
+    error_message: string|null; column_relevance_result: object|null;
+  }
+
+  // Cleaning
+  interface CleaningSummaryResponse {
+    job_id: number; row_count_original: number; row_count_cleaned: number;
+    duplicates_removed: number; columns_renamed: number; columns_dropped: number;
+    dates_converted: number; ages_bucketed: number; missing_filled: number;
+    outliers_flagged: number; quality_score: number;
+    column_metadata: Record<string, ColumnMeta>; created_at: string;
+  }
+  interface AuditLogEntry {
+    id: number; job_id: number; row_index: number|null; column_name: string|null;
+    action: string; original_value: string|null; new_value: string|null;
+    reason: string|null; formula_id: string|null; was_auto_applied: boolean;
+    timestamp: string;
+  }
+
+  // Charts
+  interface ChartResponse {
+    id: number; job_id: number; chart_type: string;
+    x_header: string; y_header: string; title: string;
+    data: any[]; config: Record<string, any>; is_recommended: boolean;
+  }
+
+  // Insights
+  interface InsightResponse {
+    id: number; chart_id: number|null; job_id: number;
+    content: string; confidence: string; confidence_score: number;
+    recommendations: { action: string; reasoning: string }[];
+  }
+
+  ... and so on for all schemas in backend/app/schemas/
+
+───────────────────────────────────────────────────────────────────────────
+LAYER 3: AUTH CONTEXT (global authentication state)
+───────────────────────────────────────────────────────────────────────────
+
+Create: lib/auth/auth-context.tsx
+
+  Purpose: React context that provides:
+    • user: UserResponse | null
+    • token: string | null
+    • login(email, password) → stores token, fetches user via /auth/me
+    • register(name, email, password) → creates account, auto-logs in
+    • logout() → clears token + user, redirects to /auth/login
+    • isLoading: boolean (initial session check)
+
+  Token storage: localStorage("access_token")
+
+  On app mount: Check if token exists in localStorage →
+    if yes, call GET /auth/me to validate it →
+      if 200, set user state
+      if 401, clear token (expired)
+
+  Wrap the entire app in <AuthProvider> in app/layout.tsx.
+
+Create: lib/auth/use-auth.ts
+  Custom hook: useAuth() → useContext(AuthContext)
+
+Create: components/auth/protected-route.tsx
+  HOC or wrapper that checks useAuth().user:
+    if no user and not loading → redirect to /auth/login
+    if loading → show loading spinner
+    if user exists → render children
+
+  Apply to app/dashboard/layout.tsx so ALL dashboard routes are protected.
+
+───────────────────────────────────────────────────────────────────────────
+LAYER 4: API SERVICE MODULES (organized by domain)
+───────────────────────────────────────────────────────────────────────────
+
+Create these files, each exporting typed functions:
+
+lib/api/auth.ts
+  • register(name, email, password) → UserResponse
+  • login(email, password) → Token
+  • getMe() → UserResponse
+
+lib/api/upload.ts
+  • uploadFile(file: File) → UploadJobResponse
+  • listJobs() → UploadJobListResponse[]
+  • getJob(jobId: number) → UploadJobResponse
+  • getJobStatus(jobId: number) → JobStatusResponse
+  • deleteJob(jobId: number) → void
+  • reviewColumns(jobId: number, confirmedColumns: string[]) → UploadJobResponse
+
+lib/api/cleaning.ts
+  • getCleaningSummary(jobId: number) → CleaningSummaryResponse
+  • getAuditTrail(jobId: number, page?: number) → AuditLogEntry[]
+  • getMissingFields(jobId: number) → MissingFieldsResponse
+  • fillMissing(jobId: number, column: string, rowIndices: number[], values: string[]) → void
+  • getOutliers(jobId: number) → OutliersResponse
+  • resolveOutlier(jobId: number, rowIndex: number, action: string) → void
+  • exportCSV(jobId: number) → Blob
+
+lib/api/ai-analysis.ts
+  • analyzeHeaders(jobId: number) → HeaderAnalysisResponse
+  • dropColumns(jobId: number, columns: string[]) → void
+  • getFormulaSuggestions(jobId: number) → FormulaSuggestionsResponse
+
+lib/api/charts.ts
+  • setGoal(jobId: number, goalText: string, goalCategory: string) → GoalResponse
+  • getGoal(jobId: number) → GoalResponse
+  • getRecommendations(jobId: number) → RecommendationItem[]
+  • generateChart(jobId: number, xCol: string, yCol: string) → ChartResponse
+  • listCharts(jobId: number) → ChartListItem[]
+  • getChart(jobId: number, chartId: number) → ChartResponse
+  • deleteChart(jobId: number, chartId: number) → void
+  • getCorrelation(jobId: number) → CorrelationResponse
+
+lib/api/insights.ts
+  • generateInsight(jobId: number, chartId: number) → InsightResponse
+  • listInsights(jobId: number) → InsightResponse[]
+  • getInsight(insightId: number) → InsightResponse
+  • addAnnotation(jobId: number, chartId: number, dataPointIndex: number, text: string) → void
+  • listAnnotations(jobId: number, chartId: number) → AnnotationResponse[]
+  • deleteAnnotation(annotationId: number) → void
+
+lib/api/comparison.ts
+  • createComparison(jobId1: number, jobId2: number) → ComparisonResponse
+  • confirmMapping(compId: number, mapping: Record<string, string>) → ComparisonResponse
+  • getDeltas(compId: number) → ComparisonResponse
+  • getSignificantChanges(compId: number) → ComparisonResponse
+  • generateComparisonInsight(compId: number) → ComparisonResponse
+
+───────────────────────────────────────────────────────────────────────────
+LAYER 5: ENVIRONMENT CONFIGURATION
+───────────────────────────────────────────────────────────────────────────
+
+Create: Frontend/refinex/.env.local
+  NEXT_PUBLIC_API_URL=http://localhost:8000
+
+Update: Frontend/refinex/next.config.ts
+  Add env configuration or API proxy if needed.
+
+
+═══════════════════════════════════════════════════════════════════════════
+PART 4: PAGE-BY-PAGE WIRING (what to change in each file)
+═══════════════════════════════════════════════════════════════════════════
+
+Each entry shows: CURRENT STATE → WHAT TO CHANGE → WHICH API CALLS
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /auth/login (app/auth/login/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: setTimeout 1.5s → router.push("/dashboard")
+CHANGE:
+  • Import { useAuth } from "@/lib/auth/use-auth"
+  • Replace setTimeout with: await auth.login(email, password)
+  • Add error state for "Incorrect email or password" (HTTP 401)
+  • Add loading state on the submit button
+  • On success: router.push("/dashboard")
+API CALLS: POST /auth/login (form-encoded)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /auth/signup (app/auth/signup/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: setTimeout 2s → router.push("/auth/onboarding")
+CHANGE:
+  • Import { useAuth } from "@/lib/auth/use-auth"
+  • Replace setTimeout with: await auth.register(name, email, password)
+  • Add error state for "Email already registered" (HTTP 409)
+  • On success: auto-login, then router.push("/auth/onboarding")
+API CALLS: POST /auth/register, then POST /auth/login
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /auth/onboarding (app/auth/onboarding/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 3-step wizard, all local state, setTimeout on complete
+CHANGE:
+  • Step 3 "Upload file" should call uploadFile(file) from lib/api/upload
+  • Steps 1-2 data (org type, team size, workspace name, goal) could be
+    stored locally for now OR sent to a future /onboarding endpoint
+  • NOTE: Backend does NOT have onboarding/workspace endpoints yet.
+    For MVP, just wire Step 3's file upload and skip Steps 1-2 persistence.
+API CALLS: POST /upload (Step 3 only for now)
+BACKEND GAP: Need POST /workspaces endpoint for Step 2 (future)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /auth/forgot-password (app/auth/forgot-password/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: No submit handler at all
+CHANGE: Backend has no password reset endpoint.
+BACKEND GAP: Need POST /auth/forgot-password and POST /auth/reset-password
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard (app/dashboard/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: All hardcoded (username "John", recentAnalyses, latestInsights,
+         chartItems, recommendations)
+CHANGE:
+  • Fetch user name from auth context → useAuth().user.name
+  • Fetch recent analyses from: GET /upload/jobs (take last 5)
+  • Fetch latest insights from: GET /jobs/{latest_job_id}/insights
+  • Fetch chart items: derive from GET /jobs/{id}/charts for recent jobs
+  • Recommendations: derive from GET /jobs/{id}/recommendations
+  • Convert from server component to client component (needs hooks)
+API CALLS: GET /auth/me, GET /upload/jobs, GET /jobs/{id}/insights,
+           GET /jobs/{id}/charts
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/upload (app/dashboard/upload/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: handleFile() → setTimeout 2s → shows mockCSVData → redirect
+CHANGE:
+  • Replace setTimeout with: const job = await uploadFile(file)
+  • Start polling: loop calling getJobStatus(job.id) every 2 seconds
+  • When status === "awaiting_review":
+      Show column_relevance_result (column recommendations from GPT-4o)
+      Let user check/uncheck columns
+      Call reviewColumns(job.id, confirmedColumns) to resume pipeline
+  • When status === "completed":
+      Redirect to /dashboard/project/new/profile?jobId={job.id}
+  • Show real progress bar based on response.progress (0-100)
+  • Handle "failed" status with error message display
+  • Remove all mockCSVData imports
+API CALLS: POST /upload, GET /upload/jobs/{id}/status (polling),
+           POST /upload/jobs/{id}/review
+
+THIS IS THE MOST CRITICAL PAGE — it's the entry point to the entire
+data pipeline and needs the most careful implementation.
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/project/new/profile (Step 1: Data Profiling)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: Uses mockColumnProfiles from lib/mock-data/csv-data
+CHANGE:
+  • Read jobId from URL search params
+  • Fetch: GET /jobs/{jobId}/cleaning-summary
+  • Map column_metadata to the profile UI:
+      column_metadata has per-column: dtype, null_count, unique_count, sample
+      Map to: name, type, completeness, uniqueValues, quality, samples
+  • Replace mockColumnProfiles with real data
+  • Summary cards calculate from real column_metadata
+API CALLS: GET /jobs/{jobId}/cleaning-summary
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/project/new/clean (Step 2: Data Cleaning)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: Uses mockCSVData, simulates auto-clean with setTimeout
+CHANGE:
+  • Fetch cleaning summary: GET /jobs/{jobId}/cleaning-summary
+  • "Before" = row_count_original, "After" = row_count_cleaned
+  • Cleaning log: GET /jobs/{jobId}/audit-trail
+  • Missing fields: GET /jobs/{jobId}/missing-fields
+  • Per-column fill strategy: POST /jobs/{jobId}/fill-missing
+  • The "auto-clean" is already done by the backend pipeline —
+    this page shows RESULTS, not triggers
+  • Data preview: GET /jobs/{jobId}/export (parse first N rows)
+    OR derive from cached DataFrame via a new lightweight endpoint
+API CALLS: GET /jobs/{id}/cleaning-summary, GET /jobs/{id}/audit-trail,
+           GET /jobs/{id}/missing-fields, POST /jobs/{id}/fill-missing
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/project/new/domain (Step 3: Domain Detection)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 6 hardcoded domain options with confidence scores
+CHANGE:
+  • This maps loosely to the AI header analysis:
+    GET /jobs/{jobId}/analyze-headers gives a dataset_summary
+  • OR the goal-setting step: POST /jobs/{jobId}/goal
+  • For domain detection specifically, the backend doesn't have a
+    dedicated endpoint. Two options:
+    Option A: Use formula-suggestions response to infer domain
+    Option B: Add a new GET /jobs/{id}/detect-domain backend endpoint
+  • For MVP: Use the existing analyze-headers response's dataset_summary
+    to populate the domain detection page
+API CALLS: GET /jobs/{id}/analyze-headers (or new endpoint)
+BACKEND GAP: Consider adding a dedicated domain detection endpoint
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/project/new/analytics (Step 4: Analytics Selection)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 6 hardcoded analytics types with group-by dropdowns
+CHANGE:
+  • Fetch recommendations: GET /jobs/{jobId}/formula-suggestions
+  • Map suggested_analyses to the card grid
+  • Map recommended_visualizations to chart type suggestions
+  • "Continue" → POST /jobs/{jobId}/goal with selected goal
+  • Then generate charts: POST /jobs/{jobId}/charts for each selection
+API CALLS: GET /jobs/{id}/formula-suggestions, POST /jobs/{id}/goal,
+           POST /jobs/{id}/charts (multiple)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/project/:id/visualize (Visualization Dashboard)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: Uses mockChartData, mockCategoryData, mockRegionData, etc.
+         All KPIs hardcoded ($740K revenue, 3,653 orders, etc.)
+CHANGE:
+  • jobId = params.id
+  • Fetch all charts: GET /jobs/{jobId}/charts
+  • Each chart has: chart_type, x_header, y_header, title, data, config
+  • The "data" field is already Recharts-compatible JSON arrays!
+    The backend generates data in exactly the format Recharts expects.
+  • KPI cards: derive from cleaning-summary or analytical_results
+  • AI insights: GET /jobs/{jobId}/insights
+  • Correlation heatmap: GET /jobs/{jobId}/correlation
+  • "Export" button: GET /jobs/{jobId}/export
+  • Remove ALL imports from lib/mock-data/charts
+API CALLS: GET /jobs/{id}/charts, GET /jobs/{id}/insights,
+           GET /jobs/{id}/correlation, GET /jobs/{id}/export
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/project/:id/insights (AI Insights)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: Uses mockInsights + hardcoded exec summary & recommendations
+CHANGE:
+  • Fetch insights: GET /jobs/{jobId}/insights
+  • Each insight has: content, confidence, confidence_score, recommendations
+  • Executive summary: concatenate high-confidence insights
+  • Recommendations: flatten recommendations arrays from all insights
+  • Statistical summary: GET /jobs/{jobId}/cleaning-summary (quality_score,
+    row counts, column metadata)
+  • "Export PDF" button: Would need a new backend endpoint or client-side
+    PDF generation (html2pdf.js or similar)
+  • Remove mockInsights import
+API CALLS: GET /jobs/{id}/insights, GET /jobs/{id}/cleaning-summary
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/analyses (app/dashboard/analyses/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 3 hardcoded items (server component)
+CHANGE:
+  • Convert to client component (needs useEffect/useState)
+  • Fetch: GET /upload/jobs
+  • Map each job to: filename, goal (from user_goals), status,
+    quality_score, row_count, column_count
+  • "View Report" → /dashboard/project/{job.id}/visualize
+  • Search/filter: client-side filtering of the jobs array
+API CALLS: GET /upload/jobs
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/datasets (app/dashboard/datasets/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 2 hardcoded items (server component)
+CHANGE:
+  • Convert to client component
+  • Fetch: GET /upload/jobs (filter where status === "completed")
+  • "Show cleaned" → navigate to project view
+  • "Download CSV" → GET /jobs/{id}/export
+  • "Download XLSX" → backend only supports CSV export currently
+API CALLS: GET /upload/jobs, GET /jobs/{id}/export
+BACKEND GAP: Add XLSX export support (or convert client-side)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/insights (app/dashboard/insights/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 3 hardcoded items (server component)
+CHANGE:
+  • Convert to client component
+  • Fetch all jobs: GET /upload/jobs
+  • For each completed job, fetch: GET /jobs/{id}/insights
+  • Aggregate all insights across all jobs
+  • Filter by category (map confidence/content to categories)
+API CALLS: GET /upload/jobs, GET /jobs/{id}/insights (per job)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/visualizations (app/dashboard/visualizations/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 4 hardcoded items (server component)
+CHANGE:
+  • Convert to client component
+  • Fetch all jobs, then for each: GET /jobs/{id}/charts
+  • Aggregate all charts across all jobs
+  • Each chart's data is Recharts-compatible, so rendering is direct
+  • "Download PNG/SVG" → client-side chart export (recharts + html2canvas)
+API CALLS: GET /upload/jobs, GET /jobs/{id}/charts (per job)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/projects (app/dashboard/projects/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: Uses mockProjects from lib/mock-data/projects
+CHANGE:
+  • Fetch: GET /upload/jobs → map each job to a "project"
+  • In RefineX, a "project" ≈ an upload job with its associated data
+  • Map: job.filename → project title, job.status → project status,
+    job.quality_score → progress, job.created_at → dates
+  • Project card click → /dashboard/project/{job.id}/visualize
+  • Delete → DELETE /upload/jobs/{id}
+  • Remove mockProjects import
+  • NOTE: Backend doesn't have a dedicated "projects" concept.
+    Each UploadJob IS effectively a project.
+API CALLS: GET /upload/jobs, DELETE /upload/jobs/{id}
+BACKEND GAP: Consider adding a "projects" model that groups multiple
+             jobs together (future enhancement)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/reports (app/dashboard/reports/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 6 hardcoded report items
+CHANGE:
+  • Each "report" = a completed job with its full analysis
+  • Fetch: GET /upload/jobs (filter completed)
+  • Report details: aggregate cleaning-summary + insights + charts
+  • "Download" → generate PDF client-side or create backend PDF endpoint
+  • "Share" → copy link (client-side)
+API CALLS: GET /upload/jobs
+BACKEND GAP: Consider adding a PDF report generation endpoint
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/history (app/dashboard/history/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: 6 hardcoded history entries (server component)
+CHANGE:
+  • Convert to client component
+  • Fetch audit trail across all jobs:
+    For each job: GET /jobs/{id}/audit-trail
+  • Merge and sort by timestamp
+  • Map action types to display labels + emojis
+  • "Download audit log" → client-side CSV generation from audit entries
+API CALLS: GET /upload/jobs, GET /jobs/{id}/audit-trail (per job)
+BACKEND GAP: Consider adding a global GET /audit-trail endpoint
+             that spans all jobs for a user (more efficient)
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: /dashboard/settings (app/dashboard/settings/page.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: Hardcoded "John Doe" defaults
+CHANGE:
+  • Fetch user: useAuth().user → populate name, email
+  • "Save Changes" → future PUT /auth/profile endpoint
+  • Password change → future PUT /auth/change-password
+  • Most settings (notifications, theme, data retention) are
+    client-side preferences → store in localStorage for now
+API CALLS: GET /auth/me (via auth context)
+BACKEND GAP: Need PUT /auth/profile, PUT /auth/change-password
+
+───────────────────────────────────────────────────────────────────────────
+PAGE: DashboardHeader (components/layout/dashboard-header.tsx)
+───────────────────────────────────────────────────────────────────────────
+CURRENT: Hardcoded "John Doe", "john@example.com", "JD" initials,
+         "Rider Payments" workspace
+CHANGE:
+  • Import useAuth → display user.name, user.email
+  • Derive initials from user.name
+  • "Sign Out" → auth.logout()
+  • Workspace dropdown → future feature (backend has no workspaces yet)
+  • Search bar → client-side search across jobs/charts/insights
+  • Notifications bell → future feature (backend has no notifications)
+API CALLS: Uses auth context only
+
+
+═══════════════════════════════════════════════════════════════════════════
+PART 5: BACKEND GAPS (endpoints that need to be built)
+═══════════════════════════════════════════════════════════════════════════
+
+The backend covers the CORE DATA PIPELINE comprehensively (upload,
+cleaning, AI analysis, charts, insights, comparison). But the frontend
+also has pages that need endpoints not yet built:
+
+PRIORITY 1 (Needed for MVP):
+  None — the core pipeline is fully covered. All critical pages can
+  be wired with existing endpoints.
+
+PRIORITY 2 (Needed for full feature parity):
+  • PUT  /auth/profile              → Update user name/email
+  • PUT  /auth/change-password      → Change password
+  • POST /auth/forgot-password      → Send password reset email
+  • POST /auth/reset-password       → Reset password with token
+  • GET  /jobs/{id}/data-preview    → Return first N rows of cleaned data
+                                      (currently only full export exists)
+  • GET  /audit-trail               → Global audit trail across all jobs
+
+PRIORITY 3 (Nice to have):
+  • POST /workspaces                → Create workspace (groups jobs)
+  • GET  /workspaces                → List workspaces
+  • POST /onboarding                → Save onboarding preferences
+  • GET  /jobs/{id}/detect-domain   → AI domain detection
+  • GET  /reports/{id}/pdf          → Generate downloadable PDF report
+  • GET  /notifications             → User notifications
+  • POST /newsletter/subscribe      → Newsletter subscription
+
+
+═══════════════════════════════════════════════════════════════════════════
+PART 6: RECOMMENDED IMPLEMENTATION ORDER
+═══════════════════════════════════════════════════════════════════════════
+
+Phase 1 — Foundation (do these first, everything else depends on them):
+  □ 1. Create lib/api/client.ts (HTTP client with auth)
+  □ 2. Create lib/api/types.ts (TypeScript interfaces)
+  □ 3. Create lib/auth/auth-context.tsx (AuthProvider)
+  □ 4. Create lib/auth/use-auth.ts (useAuth hook)
+  □ 5. Create components/auth/protected-route.tsx
+  □ 6. Create .env.local with NEXT_PUBLIC_API_URL
+  □ 7. Wrap app in AuthProvider (app/layout.tsx)
+  □ 8. Wrap dashboard in ProtectedRoute (app/dashboard/layout.tsx)
+
+Phase 2 — Auth Flow (login must work before anything else):
+  □ 9.  Wire /auth/signup → POST /auth/register + auto-login
+  □ 10. Wire /auth/login → POST /auth/login (form-encoded!)
+  □ 11. Wire DashboardHeader → useAuth() for user info + logout
+  □ 12. Wire /dashboard/settings → useAuth() for profile display
+
+Phase 3 — Core Pipeline (the heart of the app):
+  □ 13. Create lib/api/upload.ts service module
+  □ 14. Wire /dashboard/upload → real file upload + polling + review
+  □ 15. Create lib/api/cleaning.ts service module
+  □ 16. Wire /dashboard/project/new/profile → cleaning-summary
+  □ 17. Wire /dashboard/project/new/clean → audit-trail + missing-fields
+  □ 18. Wire /dashboard/project/new/domain → analyze-headers
+  □ 19. Create lib/api/charts.ts service module
+  □ 20. Wire /dashboard/project/new/analytics → formula-suggestions + goal
+  □ 21. Create lib/api/insights.ts service module
+  □ 22. Wire /dashboard/project/:id/visualize → charts + insights
+  □ 23. Wire /dashboard/project/:id/insights → insights + cleaning-summary
+
+Phase 4 — Dashboard Pages:
+  □ 24. Wire /dashboard → recent jobs + insights
+  □ 25. Wire /dashboard/analyses → job list
+  □ 26. Wire /dashboard/datasets → completed jobs + export
+  □ 27. Wire /dashboard/insights → aggregated insights
+  □ 28. Wire /dashboard/visualizations → aggregated charts
+  □ 29. Wire /dashboard/projects → job list as projects
+  □ 30. Wire /dashboard/history → audit trails
+  □ 31. Wire /dashboard/reports → completed jobs
+
+Phase 5 — Polish:
+  □ 32. Add loading skeletons to all pages (Skeleton component exists)
+  □ 33. Add error states with retry buttons
+  □ 34. Add empty states (EmptyState component exists)
+  □ 35. Remove all files in lib/mock-data/ (no longer needed)
+  □ 36. Test full flow: signup → upload → review → clean → visualize
+
+
+═══════════════════════════════════════════════════════════════════════════
+PART 7: CRITICAL NOTES & GOTCHAS
+═══════════════════════════════════════════════════════════════════════════
+
+1. LOGIN USES FORM-ENCODED BODY, NOT JSON
+   The backend's /auth/login uses OAuth2PasswordRequestForm which expects
+   Content-Type: application/x-www-form-urlencoded
+   Body: username=<email>&password=<password>
+   NOT: { "email": "...", "password": "..." }
+   The field is called "username" even though it's an email.
+
+2. FILE UPLOAD USES MULTIPART FORM DATA
+   POST /upload expects multipart/form-data with field name "file".
+   Do NOT set Content-Type header manually — let the browser set it
+   with the correct boundary.
+
+3. CHART DATA IS ALREADY RECHARTS-COMPATIBLE
+   The backend's Chart model stores data as JSON arrays that are
+   formatted for direct use with Recharts. No transformation needed.
+   Just pass chart.data directly to <LineChart data={chart.data}>.
+
+4. THE PIPELINE HAS A HUMAN-IN-THE-LOOP STEP
+   After upload, the pipeline pauses at "awaiting_review" status.
+   The frontend MUST implement the column review UI:
+   - Poll status until awaiting_review
+   - Show column_relevance_result (GPT-4o's recommendations)
+   - Let user check/uncheck columns
+   - POST /upload/jobs/{id}/review with confirmed_columns
+   - Continue polling until "completed"
+   Without this, the pipeline never finishes.
+
+5. CORS IS ALREADY CONFIGURED
+   main.py already has:
+   allow_origins=["http://localhost:3000"]
+   No proxy configuration needed.
+
+6. MANY FRONTEND PAGES ARE SERVER COMPONENTS
+   Analyses, Datasets, Insights, Visualizations, History are all
+   server components (no 'use client'). To add hooks (useState,
+   useEffect, useAuth), they must be converted to client components
+   by adding 'use client' at the top.
+
+7. THE FRONTEND HAS NO CONCEPT OF "JOB ID"
+   The current URL structure uses /dashboard/project/:id but the
+   backend uses job IDs. The mapping is: project ID = upload job ID.
+   The new project flow should pass the job ID through URL search
+   params: /dashboard/project/new/profile?jobId=123
+
+8. JWT EXPIRY IS 30 MINUTES
+   Tokens expire in 30 minutes. The frontend should:
+   - Catch 401 errors globally in the API client
+   - Clear token and redirect to login
+   - Consider adding a token refresh mechanism (backend doesn't
+     have a refresh endpoint yet, but could be added)
+
+9. BACKEND RUNS ON 4 PROCESSES
+   You need: PostgreSQL + Redis + MinIO (via docker-compose),
+   then: uvicorn (API), celery worker, and optionally celery beat.
+   All must be running for the full pipeline to work.
+
+10. THE ONBOARDING WIZARD PARTIALLY MAPS TO BACKEND
+    Step 1 (org type) → No backend endpoint
+    Step 2 (workspace) → No backend endpoint  
+    Step 3 (file upload) → POST /upload (this works!)
+    For MVP, only wire Step 3. Steps 1-2 can store in localStorage.
+
+
+═══════════════════════════════════════════════════════════════════════════
+PART 8: MAPPING SUMMARY — FRONTEND PAGE → BACKEND ENDPOINT
+═══════════════════════════════════════════════════════════════════════════
+
+Frontend Page                          Backend Endpoint(s)
+─────────────────────────────────────  ─────────────────────────────────
+/auth/login                            POST /auth/login
+/auth/signup                           POST /auth/register
+/auth/onboarding (Step 3)              POST /upload
+/auth/forgot-password                  ✗ NO ENDPOINT
+/dashboard                             GET /upload/jobs + /jobs/{id}/insights
+/dashboard/upload                      POST /upload
+                                       GET /upload/jobs/{id}/status (poll)
+                                       POST /upload/jobs/{id}/review
+/dashboard/project/new/profile         GET /jobs/{id}/cleaning-summary
+/dashboard/project/new/clean           GET /jobs/{id}/cleaning-summary
+                                       GET /jobs/{id}/audit-trail
+                                       GET /jobs/{id}/missing-fields
+                                       POST /jobs/{id}/fill-missing
+/dashboard/project/new/domain          GET /jobs/{id}/analyze-headers
+/dashboard/project/new/analytics       GET /jobs/{id}/formula-suggestions
+                                       POST /jobs/{id}/goal
+                                       POST /jobs/{id}/charts
+/dashboard/project/:id/visualize       GET /jobs/{id}/charts
+                                       GET /jobs/{id}/insights
+                                       GET /jobs/{id}/correlation
+/dashboard/project/:id/insights        GET /jobs/{id}/insights
+                                       GET /jobs/{id}/cleaning-summary
+/dashboard/analyses                    GET /upload/jobs
+/dashboard/datasets                    GET /upload/jobs + /jobs/{id}/export
+/dashboard/insights                    GET /upload/jobs + /jobs/{id}/insights
+/dashboard/visualizations              GET /upload/jobs + /jobs/{id}/charts
+/dashboard/projects                    GET /upload/jobs
+/dashboard/reports                     GET /upload/jobs
+/dashboard/history                     GET /upload/jobs + /jobs/{id}/audit-trail
+/dashboard/settings                    GET /auth/me
+DashboardHeader                        GET /auth/me (via context)
+Sidebar                                No API needed (static nav)
+
+═══════════════════════════════════════════════════════════════════════════
+END OF ANALYSIS
+═══════════════════════════════════════════════════════════════════════════
+
+Total backend endpoints: 40 (all built and tested)
+Total frontend pages: ~20 (all built with mock data)
+New files needed for integration: ~12 (API client, types, auth context,
+  service modules, env config, protected route wrapper)
+Backend gaps for full parity: ~7 endpoints (Priority 2-3, not blockers)
+Estimated integration effort: The foundations (Phase 1-2) are ~1 day.
+  Core pipeline wiring (Phase 3) is ~2-3 days. Dashboard pages
+  (Phase 4) are ~1-2 days. Polish (Phase 5) is ~1 day.

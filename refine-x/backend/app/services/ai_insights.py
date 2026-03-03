@@ -289,6 +289,111 @@ Return ONLY valid JSON:
     return result
 
 
+def _generate_fallback_insight(
+    chart_type: str,
+    x_header: str,
+    y_header: str | None,
+    chart_data: list[dict],
+    user_goal: str,
+) -> dict:
+    """
+    Fully deterministic insight generation — no GPT required.
+    Uses _precompute_statistics() to derive natural language findings.
+    """
+    stats = _precompute_statistics(chart_data, x_header)
+    y_label = y_header or "count"
+
+    if "error" in stats:
+        insight = (
+            f"This {chart_type} chart displays {x_header} on the X-axis and {y_label} on the Y-axis. "
+            f"Insufficient numeric data was available to compute detailed statistics."
+        )
+        return {
+            "insight": insight,
+            "confidence": "low",
+            "confidence_score": 0.2,
+            "recommendations": [],
+        }
+
+    parts = []
+    recs = []
+
+    avg = stats["averages"]
+    peaks = stats["peaks"]
+    lows = stats["lows"]
+    n = avg["count"]
+
+    # Opening sentence
+    parts.append(
+        f"This {chart_type} chart compares {x_header} (X-axis) against {y_label} (Y-axis) "
+        f"across {n} data point{'s' if n != 1 else ''}."
+    )
+
+    # Peak & low
+    parts.append(
+        f"The highest value is {peaks['maximum_value']:,} at '{peaks['maximum_at']}', "
+        f"while the lowest is {lows['minimum_value']:,} at '{lows['minimum_at']}'. "
+        f"The mean is {avg['mean']:,} with a total of {avg['total']:,}."
+    )
+
+    # Trend
+    trend = stats.get("trends", {})
+    direction = trend.get("direction", "unknown")
+    if direction in ("increasing", "decreasing"):
+        pct = trend.get("overall_change_percent", 0)
+        parts.append(
+            f"Overall, {y_label} shows a {direction} trend with a {abs(pct):.1f}% "
+            f"{'increase' if pct >= 0 else 'decrease'} from first to last point "
+            f"(R\u00b2 = {trend.get('r_squared', 0):.2f})."
+        )
+        recs.append({
+            "action": f"Investigate what drives the {direction} trend in {y_label}",
+            "reasoning": f"A {abs(pct):.1f}% change was detected across the dataset.",
+        })
+    elif direction == "stable":
+        parts.append(f"{y_label} remains relatively stable across all {x_header} values.")
+
+    # Period comparison
+    period = stats.get("period_comparisons", {})
+    if "change_percent" in period:
+        cp = period["change_percent"]
+        if abs(cp) >= 5:
+            half_dir = "improved" if cp > 0 else "declined"
+            parts.append(
+                f"Comparing first half to second half, performance {half_dir} by {abs(cp):.1f}% "
+                f"(avg {period['first_half_average']:,} \u2192 {period['second_half_average']:,})."
+            )
+
+    # Outliers
+    outliers = stats.get("outliers", {})
+    if outliers.get("count", 0) > 0:
+        pts = outliers["outlier_points"]
+        labels = ", ".join(f"'{p['x']}' ({p['y']:,})" for p in pts[:3])
+        parts.append(f"{outliers['count']} outlier{'s' if outliers['count'] != 1 else ''} detected: {labels}.")
+        recs.append({
+            "action": f"Review the outlier{'s' if outliers['count'] != 1 else ''} in {x_header}",
+            "reasoning": f"Values at {labels} fall outside the expected IQR range.",
+        })
+
+    # Goal alignment
+    if user_goal and user_goal.lower() not in ("general data analysis", "general analysis", ""):
+        recs.append({
+            "action": f"Align findings with your goal: {user_goal}",
+            "reasoning": "Focus on the peak and trend values most relevant to this objective.",
+        })
+
+    # Confidence from trend quality or data size
+    r2 = trend.get("r_squared", 0) if direction not in ("unknown", "insufficient_data") else 0
+    score = max(0.35, min(0.85, 0.4 + r2 * 0.4 + min(n, 20) * 0.01))
+
+    return {
+        "insight": " ".join(parts),
+        "confidence": _confidence_category(score),
+        "confidence_score": round(score, 3),
+        "recommendations": recs[:3],
+    }
+
+
 def generate_comparison_insight(deltas: list[dict], significant: list[dict]) -> str:
     """Generate a plain-text AI insight explaining comparison deltas."""
     delta_text = json.dumps(deltas[:20], default=str, indent=2)

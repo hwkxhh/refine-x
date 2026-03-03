@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
@@ -17,8 +17,15 @@ class UploadJob(Base):
     file_type = Column(String, nullable=False)  # 'csv' or 'xlsx'
 
     # Processing status
-    status = Column(String, default="pending")  # pending/processing/completed/failed
+    # Valid values: pending / processing / awaiting_review / completed / failed
+    status = Column(String, default="pending")
     error_message = Column(String, nullable=True)
+
+    # Column Relevance Gate (populated after GlobalRules + StructRules,
+    # before AI Classification). Pipeline pauses at status="awaiting_review"
+    # until the user confirms which columns to keep.
+    column_relevance_result = Column(JSON, nullable=True)   # GPT-4o assessment payload
+    confirmed_columns = Column(JSON, nullable=True)          # user-approved column list
 
     # Results (filled after processing)
     row_count = Column(Integer, nullable=True)

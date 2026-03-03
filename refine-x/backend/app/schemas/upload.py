@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 
 class UploadJobResponse(BaseModel):
@@ -12,6 +12,8 @@ class UploadJobResponse(BaseModel):
     quality_score: Optional[float] = None
     row_count: Optional[int] = None
     column_count: Optional[int] = None
+    column_relevance_result: Optional[Dict[str, Any]] = None
+    confirmed_columns: Optional[List[str]] = None
     created_at: datetime
     processed_at: Optional[datetime] = None
 
@@ -35,3 +37,9 @@ class JobStatusResponse(BaseModel):
     quality_score: Optional[float] = None
     row_count: Optional[int] = None
     error_message: Optional[str] = None
+    column_relevance_result: Optional[Dict[str, Any]] = None
+
+
+class ColumnReviewRequest(BaseModel):
+    """Body for POST /upload/jobs/{job_id}/review"""
+    confirmed_columns: List[str]
