@@ -13,6 +13,8 @@ def calculate_quality_score(df: pd.DataFrame, original_row_count: int) -> float:
     Consistency   20% — % of columns with uniform dtype
     Integrity     10% — penalises null cells still remaining after cleaning
     """
+    if original_row_count == 0:
+        return 0.0
     if df.empty or len(df.columns) == 0:
         return 0.0
 

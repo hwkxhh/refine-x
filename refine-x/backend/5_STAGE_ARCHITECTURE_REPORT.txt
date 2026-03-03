@@ -488,5 +488,98 @@ fuel               │ HTYPE-044  │ CALC-01, CALC-02, CALC-03, CALC-05 (Distan
 total_earning      │ HTYPE-015  │ AMT-01 through AMT-13 (final payment amount)
 
 ================================================================================
+              SESSION 3 — POST-BANK-FULL.CSV BUG-FIX PASS
+================================================================================
+
+CONTEXT
+-------
+After 53/53 backend tests passed and the sign-off report was written, the pipeline
+was run against bank-full.csv (45,211 rows) and failed 5 consecutive times. A root-
+cause analysis identified 20 errors across 6 files. Errors 1–4 were fixed in prior
+work (VER-01 dtype guard, trend/distribution/forecast float-cast guards, __init__
+dtype filter). This session fixed the remaining 16 open errors.
+
+FILES CHANGED
+-------------
+
+1. app/services/org_product_rules.py
+   • VER-02 (Error 19): Added `if self.df[col].dtype.kind in ("i", "f"): return result`
+     before the parsed_versions dict. Integer/float columns were being incorrectly
+     flagged as version strings.
+   • VER-03 (Error 7): Added same dtype guard before sort_col creation. Without it a
+     phantom "{col}_sort_key" column was written for every numeric column.
+
+2. app/services/analytical_formulas.py
+   • Error 9 — detect_date_column: Corrected HTYPE codes from HTYPE-013/014/015 to
+     HTYPE-004/005/006. Wrong codes meant date columns were never found, causing all
+     forecasting and time-series analysis to silently produce no output.
+   • Error 8 — detect_numeric_columns: Corrected HTYPE codes from HTYPE-019..025 to
+     HTYPE-015/016/017/042/043/044. Same root cause — no numeric columns were found,
+     so all formulas that depend on them returned empty results.
+   • Error 20 — an_16_goal_vs_actual: Replaced bare list comprehension `[v for v in ...]`
+     with a try/except float loop. Mixed-type columns (e.g. "N/A", "#VALUE!") caused
+     TypeError: unsupported operand type(s) for +: 'int' and 'str'.
+   • Error 5 — an_18_concentration_index: Replaced `v > 0` comparison with a float-cast
+     loop. String values raised TypeError on the comparison.
+   • Error 5 — run_concentration_analysis: Changed `.tolist()` to `.dropna().tolist()`
+     to prevent NaN from entering concentration calculations.
+   • Error 6 — run_forecast: Added `[float(v) for v in raw]` guard with try/except.
+     Forecast helper requires a list of floats; mixed columns crashed silently.
+
+3. app/services/cleaning.py
+   • Error 11 — detect_and_convert_dates: Added a _DATE_KEYWORDS set and early-continue
+     guard. Without it, EVERY object column was tested for date patterns, converting
+     columns like "job", "marital", "education" to NaT-filled date columns.
+   • Error 10 — detect_and_bucket_ages: Added a _AGE_KEYWORDS set and early-continue
+     guard. Without it, EVERY numeric column was tested for the 0–120 range and
+     bucketed into age bins (e.g. "balance", "duration" were turned into age brackets).
+
+4. app/services/duplicate_resolution.py
+   • Error 14 — run_all: Added a row-count guard: if len(self.df) > 10,000 the fuzzy
+     dedup step is skipped entirely and a FUZZY_DEDUP_SKIPPED log entry is written.
+     Fuzzy dedup is O(n²); on 45k rows it allocated >6 GB of RAM and OOM-killed the
+     Celery worker.
+
+5. app/services/quality.py
+   • Error 16 — calculate_quality_score: Added `if original_row_count == 0: return 0.0`
+     guard before the df.empty check. A zero-row input caused ZeroDivisionError at the
+     uniqueness calculation step.
+
+6. app/tasks/process_csv.py
+   • Error 12 — encoding fallback: All pd.read_csv calls now try UTF-8 first; on
+     UnicodeDecodeError they retry with encoding="latin-1". Files exported from
+     Windows Excel or legacy databases often use latin-1.
+   • Error 13 — delimiter auto-detection: All pd.read_csv calls now pass sep=None and
+     engine="python". Previously every CSV was assumed to be comma-separated; tab-
+     delimited and semicolon-delimited files loaded as a single column.
+   • Error 15 — np.inf in col_meta: The sample values in col_meta are now sanitised.
+     float("inf") and float("-inf") are replaced with None before the dict is
+     serialised to JSON. json.dumps raises ValueError on infinity values.
+   • Error 17 — headerless CSV detection: After loading, if ≥70% of column names are
+     numeric strings the file is re-read with header=None and columns are renamed to
+     col_0, col_1, … A HEADERLESS_FILE_DETECTED struct flag is written.
+   • Error 18 — Excel multi-sheet: pd.read_excel() was replaced with pd.ExcelFile().
+     All sheet names are enumerated; the sheet with the most rows is selected. If more
+     than one sheet exists, an EXCEL_MULTI_SHEET struct flag is written listing all
+     sheet names, the selected sheet, and its row count.
+
+WHAT IS MISSING / NOT DONE
+---------------------------
+• No new automated tests were written for any of these fixes. The test suite at
+  tests/ has no coverage for: encoding fallback, delimiter detection, headerless
+  detection, Excel multi-sheet selection, np.inf sanitisation, the HTYPE code
+  corrections, or the VER-02/VER-03 dtype guards.
+• The _DATE_KEYWORDS and _AGE_KEYWORDS sets are defined inline inside their
+  respective functions. They should be module-level constants.
+• The fuzzy dedup 10k row limit is hardcoded. There is no config entry for it.
+• Error 17 heuristic (70% numeric column names) has no tests and could misfire on
+  intentionally numeric column names.
+• The HTYPE code corrections in analytical_formulas.py were never verified against
+  the full HTYPE registry — they were inferred from column names in the rider
+  payment test file. Other HTYPE codes may still be wrong for other datasets.
+• No re-run of the 53-test suite was performed after these fixes to confirm no
+  regressions were introduced.
+
+================================================================================
                               END OF REPORT
 ================================================================================

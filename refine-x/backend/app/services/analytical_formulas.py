@@ -230,7 +230,7 @@ def detect_date_column(df: pd.DataFrame, htype_map: Dict[str, str]) -> Optional[
     """Detect the primary date column for time series analysis."""
     # First check HTYPE map
     for col, htype in htype_map.items():
-        if htype in ["HTYPE-013", "HTYPE-014", "HTYPE-015"]:  # DATE, TIME, DTM
+        if htype in ["HTYPE-004", "HTYPE-005", "HTYPE-006"]:  # DATE, TIME, DTM
             if col in df.columns:
                 return col
     
@@ -254,8 +254,8 @@ def detect_numeric_columns(df: pd.DataFrame, htype_map: Dict[str, str]) -> List[
             numeric_cols.append(col)
         # Or check HTYPE
         elif col in htype_map and htype_map[col] in [
-            "HTYPE-019", "HTYPE-020", "HTYPE-021", "HTYPE-022",  # AMT, QTY, PCT, SCORE
-            "HTYPE-023", "HTYPE-024", "HTYPE-025"  # CUR, RANK, CALC
+            "HTYPE-015", "HTYPE-016", "HTYPE-017",  # AMT, QTY, PCT
+            "HTYPE-042", "HTYPE-043", "HTYPE-044"   # CUR, RANK, CALC
         ]:
             numeric_cols.append(col)
     
@@ -851,7 +851,14 @@ def an_16_goal_vs_actual(actual_values: List[float],
     
     Calculates variance and % achievement.
     """
-    clean_values = [v for v in actual_values if not pd.isna(v)]
+    clean_values = []
+    for v in actual_values:
+        if pd.isna(v):
+            continue
+        try:
+            clean_values.append(float(v))
+        except (TypeError, ValueError):
+            continue
     total_actual = sum(clean_values)
     
     variance = total_actual - target
@@ -916,8 +923,17 @@ def an_18_concentration_index(values: List[float]) -> Dict[str, Any]:
     
     Measures how concentrated a distribution is.
     """
-    clean_values = [v for v in values if not pd.isna(v) and v > 0]
-    
+    clean_values = []
+    for v in values:
+        if pd.isna(v):
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0:
+            clean_values.append(fv)
+
     if not clean_values:
         return {"hhi": 0, "interpretation": "N/A"}
     
@@ -1237,7 +1253,11 @@ class AnalyticalFormulas:
         results = {}
         
         for col in self.numeric_cols:
-            values = self.df[col].dropna().tolist()
+            raw = self.df[col].dropna().tolist()
+            try:
+                values = [float(v) for v in raw]
+            except (TypeError, ValueError):
+                continue
             if len(values) >= 3:
                 forecast = an_17_simple_forecast(values, periods)
                 if forecast:
@@ -1250,7 +1270,7 @@ class AnalyticalFormulas:
         results = {}
         
         for col in self.numeric_cols:
-            values = self.df[col].tolist()
+            values = self.df[col].dropna().tolist()
             conc = an_18_concentration_index(values)
             results[col] = conc
             

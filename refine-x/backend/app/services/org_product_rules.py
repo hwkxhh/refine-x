@@ -1757,7 +1757,11 @@ class OrgProductRules:
     def VER_02_semantic_version_parsing(self, col: str) -> CleaningResult:
         """VER-02: Parse and validate semantic versions."""
         result = CleaningResult(column=col, formula_id="VER-02")
-        
+
+        # Skip numeric columns — integers/floats are never version strings.
+        if self.df[col].dtype.kind in ("i", "f"):
+            return result
+
         parsed_versions = {}
         invalid_versions = []
         
@@ -1791,7 +1795,11 @@ class OrgProductRules:
     def VER_03_chronological_sort_key(self, col: str) -> CleaningResult:
         """VER-03: Create sort key column for proper version ordering."""
         result = CleaningResult(column=col, formula_id="VER-03")
-        
+
+        # Skip numeric columns — integers/floats are never version strings.
+        if self.df[col].dtype.kind in ("i", "f"):
+            return result
+
         # Create sort key column
         sort_col = f"{col}_sort_key"
         

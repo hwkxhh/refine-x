@@ -64,14 +64,78 @@ def process_csv_file(self, job_id: int):
 
         # ── Load file ────────────────────────────────────────────────
         file_bytes = storage_service.download_file(job.file_path)
+        _excel_flags = []  # sheet-selection / headerless flags merged into struct_flags later
         if job.file_type in ("csv", "txt"):
-            df = pd.read_csv(io.BytesIO(file_bytes))
+            # Error 12: encoding fallback — try UTF-8 first, fall back to latin-1
+            # Error 13: sep=None + engine="python" auto-detects the delimiter
+            try:
+                df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="utf-8")
+            except UnicodeDecodeError:
+                df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="latin-1")
         elif job.file_type in ("xlsx", "xls"):
-            df = pd.read_excel(io.BytesIO(file_bytes))
+            # Error 18: pick the sheet with the most rows; flag all sheet names
+            xl = pd.ExcelFile(io.BytesIO(file_bytes))
+            sheet_names = xl.sheet_names
+            best_sheet = sheet_names[0]
+            best_count = 0
+            for sname in sheet_names:
+                try:
+                    tmp_df = xl.parse(sname, header=None)
+                    if len(tmp_df) > best_count:
+                        best_count = len(tmp_df)
+                        best_sheet = sname
+                except Exception:
+                    continue
+            df = xl.parse(best_sheet)
+            if len(sheet_names) > 1:
+                _excel_flags.append({
+                    "flag_type": "EXCEL_MULTI_SHEET",
+                    "selected_sheet": best_sheet,
+                    "all_sheets": sheet_names,
+                    "message": (
+                        f"File has {len(sheet_names)} sheets: {sheet_names}. "
+                        f"Sheet '{best_sheet}' (most rows: {best_count}) was used. "
+                        "Re-upload if a different sheet is needed."
+                    ),
+                    "pending_review": True,
+                })
         else:
-            df = pd.read_csv(io.BytesIO(file_bytes))
+            try:
+                df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="utf-8")
+            except UnicodeDecodeError:
+                df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="latin-1")
 
         original_row_count = len(df)
+
+        # Error 17: detect headerless files — if ≥70% of column names are numeric
+        # strings the file has no header row; re-read with auto-generated names.
+        if job.file_type in ("csv", "txt") and len(df.columns) > 0:
+            col_names = [str(c) for c in df.columns]
+            numeric_header_count = sum(
+                1 for c in col_names
+                if c.strip().lstrip("-").replace(".", "").isdigit()
+            )
+            if numeric_header_count / len(col_names) >= 0.7:
+                try:
+                    df = pd.read_csv(
+                        io.BytesIO(file_bytes), sep=None, engine="python",
+                        encoding="utf-8", header=None,
+                    )
+                except UnicodeDecodeError:
+                    df = pd.read_csv(
+                        io.BytesIO(file_bytes), sep=None, engine="python",
+                        encoding="latin-1", header=None,
+                    )
+                df.columns = [f"col_{i}" for i in range(len(df.columns))]
+                original_row_count = len(df)
+                _excel_flags.append({
+                    "flag_type": "HEADERLESS_FILE_DETECTED",
+                    "message": (
+                        "No header row detected — column names auto-generated as "
+                        "col_0, col_1, … Please confirm or rename columns."
+                    ),
+                    "pending_review": True,
+                })
 
         # ── GLOBAL rules (Session 1) ──────────────────────────────────
         # Must run on the raw df BEFORE any HTYPE-specific cleaning.
@@ -93,7 +157,7 @@ def process_csv_file(self, job_id: int):
         )
         struct_summary = struct_runner.run_all()
         df = struct_runner.df          # use structurally-corrected df
-        struct_flags = struct_runner.flags
+        struct_flags = _excel_flags + struct_runner.flags
 
         # ── Stage 1+2 AI Classification (Combined GPT Call) ─────────
         # GPT-4o classifies each column and assigns formulas in one call.
@@ -370,11 +434,17 @@ def process_csv_file(self, job_id: int):
         col_meta = {}
         for col in cleaned_df.columns:
             series = cleaned_df[col]
+            # Error 15: replace np.inf / -np.inf with None — JSON cannot encode infinity.
+            raw_sample = series.dropna().head(3).tolist()
+            safe_sample = [
+                None if isinstance(v, float) and (v != v or v == float("inf") or v == float("-inf")) else v
+                for v in raw_sample
+            ]
             col_meta[col] = {
                 "dtype": str(series.dtype),
                 "null_count": int(series.isnull().sum()),
                 "unique_count": int(series.nunique()),
-                "sample": series.dropna().head(3).tolist(),
+                "sample": safe_sample,
             }
 
         # ── Persist CleanedDataset ────────────────────────────────────

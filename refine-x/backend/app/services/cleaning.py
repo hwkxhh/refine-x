@@ -136,8 +136,12 @@ class DataCleaningPipeline:
 
     def detect_and_convert_dates(self) -> int:
         """Convert columns that look like dates to YYYY-MM format."""
+        _DATE_KEYWORDS = {"date", "time", "dob", "created", "updated", "timestamp", "period"}
         converted = 0
         for col in self.df.columns:
+            # Only attempt conversion if the column name suggests a date/time field.
+            if not any(kw in col.lower() for kw in _DATE_KEYWORDS):
+                continue
             if self.df[col].dtype == object:
                 sample = self.df[col].dropna().head(20)
                 if len(sample) == 0:
@@ -183,7 +187,11 @@ class DataCleaningPipeline:
                 return "36-60"
             return "60+"
 
+        _AGE_KEYWORDS = {"age", "years", "dob", "birth"}
         for col in self.df.select_dtypes(include=[np.number]).columns:
+            # Only bucket if the column name indicates an age or birth field.
+            if not any(kw in col.lower() for kw in _AGE_KEYWORDS):
+                continue
             series = self.df[col].dropna()
             if len(series) == 0:
                 continue

@@ -998,8 +998,17 @@ class DuplicateResolution:
         already_grouped = set()
         for g in exact_groups + partial_groups:
             already_grouped.update(g.row_indices)
-        
-        fuzzy_groups = self.detect_fuzzy_duplicates(exclude_indices=already_grouped)
+
+        # Guard: skip fuzzy dedup for large DataFrames — O(n²) would OOM.
+        if len(self.df) > 10000:
+            self.log_action(
+                "FUZZY_DEDUP_SKIPPED",
+                f"DataFrame has {len(self.df)} rows (limit: 10,000). "
+                "Exact deduplication was still applied.",
+            )
+            fuzzy_groups = []
+        else:
+            fuzzy_groups = self.detect_fuzzy_duplicates(exclude_indices=already_grouped)
         self.groups.extend(fuzzy_groups)
         summary.fuzzy_duplicates = len(fuzzy_groups)
         
