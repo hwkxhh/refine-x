@@ -628,6 +628,25 @@ class TextTechnicalRules:
         """Ensure column has object dtype for mixed type assignment."""
         if col in self.df.columns and self.df[col].dtype in ['string', 'object']:
             self.df[col] = self.df[col].astype(object)
+
+    def _vec_str(self, col: str, func, str_only: bool = True):
+        """
+        Vectorised helper: apply *func* to non-null (optionally str-only) values,
+        batch-assign changed cells.  Returns (new_series, changes_made: int).
+        """
+        if str_only:
+            mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        else:
+            mask = self.df[col].notna()
+        if not mask.any():
+            return self.df[col].copy(), 0
+        orig = self.df.loc[mask, col]
+        new_vals = orig.apply(func)
+        changed = new_vals != orig
+        out = self.df[col].copy()
+        if changed.any():
+            out.loc[new_vals[changed].index] = new_vals[changed]
+        return out, int(changed.sum())
     
     def add_flag(self, row_idx: int, col: str, formula_id: str,
                  message: str, value: Any, severity: str = "warning"):
@@ -661,119 +680,103 @@ class TextTechnicalRules:
     def TEXT_01_whitespace_normalization(self, col: str) -> CleaningResult:
         """TEXT-01: Normalize whitespace — trim and collapse."""
         result = CleaningResult(column=col, formula_id="TEXT-01")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            normalized = normalize_whitespace(val)
-            if normalized != val:
-                self.df.at[idx, col] = normalized
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            orig = self.df.loc[str_mask, col]
+            # ' '.join(v.split()) trims + collapses all internal whitespace
+            new_vals = orig.str.split().str.join(' ')
+            changed = new_vals != orig
+            if changed.any():
+                update_idx = changed[changed].index
+                self.df.loc[update_idx, col] = new_vals.loc[update_idx]
+                result.changes_made = int(changed.sum())
+                self.log_cleaning(result)
         return result
     
     def TEXT_02_placeholder_detection(self, col: str) -> CleaningResult:
         """TEXT-02: Detect and convert placeholders to null."""
         result = CleaningResult(column=col, formula_id="TEXT-02")
-        
-        placeholders_found = Counter()
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if is_placeholder(val):
-                placeholders_found[val.strip().lower()] += 1
-                self.df.at[idx, col] = None
-                result.changes_made += 1
-        
-        if placeholders_found:
-            result.details["placeholders_converted"] = dict(placeholders_found)
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            lower_vals = self.df.loc[str_mask, col].str.strip().str.lower()
+            placeholder_mask = lower_vals.isin(TEXT_PLACEHOLDERS)
+            if placeholder_mask.any():
+                placeholders_found = Counter(lower_vals[placeholder_mask].tolist())
+                update_idx = placeholder_mask[placeholder_mask].index
+                self.df.loc[update_idx, col] = None
+                result.changes_made = int(placeholder_mask.sum())
+                result.details["placeholders_converted"] = dict(placeholders_found)
+                self.log_cleaning(result)
         return result
     
     def TEXT_03_encoding_fix(self, col: str) -> CleaningResult:
         """TEXT-03: Fix character encoding artifacts."""
         result = CleaningResult(column=col, formula_id="TEXT-03")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            fixed = fix_encoding_artifacts(val)
-            if fixed != val:
-                self.df.at[idx, col] = fixed
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            orig = self.df.loc[str_mask, col].copy()
+            new_vals = orig.copy()
+            for old, new in ENCODING_REPLACEMENTS:
+                if old:
+                    new_vals = new_vals.str.replace(old, new, regex=False)
+            changed = new_vals != orig
+            if changed.any():
+                update_idx = changed[changed].index
+                self.df.loc[update_idx, col] = new_vals.loc[update_idx]
+                result.changes_made = int(changed.sum())
+                self.log_cleaning(result)
         return result
     
     def TEXT_04_html_markdown_stripping(self, col: str) -> CleaningResult:
         """TEXT-04: Strip HTML tags and Markdown formatting."""
         result = CleaningResult(column=col, formula_id="TEXT-04")
-        
-        html_count = 0
-        markdown_count = 0
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            modified = val
-            
-            # Check and strip HTML
-            if has_html_tags(val):
-                modified = strip_html_tags(modified)
-                html_count += 1
-            
-            # Check and strip Markdown
-            if has_markdown(modified):
-                modified = strip_markdown(modified)
-                markdown_count += 1
-            
-            if modified != val:
-                self.df.at[idx, col] = modified
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            result.details["html_stripped"] = html_count
-            result.details["markdown_stripped"] = markdown_count
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            orig = self.df.loc[str_mask, col]
+            html_mask = orig.apply(has_html_tags)
+            md_mask = orig.apply(has_markdown)
+            needs_change = html_mask | md_mask
+            if needs_change.any():
+                def _strip(v):
+                    if has_html_tags(v):
+                        v = strip_html_tags(v)
+                    if has_markdown(v):
+                        v = strip_markdown(v)
+                    return v
+                new_vals = orig[needs_change].apply(_strip)
+                changed = new_vals != orig[needs_change]
+                if changed.any():
+                    update_idx = changed[changed].index
+                    self.df.loc[update_idx, col] = new_vals.loc[update_idx]
+                    result.changes_made = int(changed.sum())
+                    result.details["html_stripped"] = int(html_mask.loc[update_idx].sum())
+                    result.details["markdown_stripped"] = int(md_mask.loc[update_idx].sum())
+                    self.log_cleaning(result)
         return result
     
     def TEXT_05_long_value_alert(self, col: str) -> CleaningResult:
         """TEXT-05: Flag extremely long text values."""
         result = CleaningResult(column=col, formula_id="TEXT-05")
-        
-        long_values = []
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if len(val) > MAX_TEXT_LENGTH:
-                long_values.append({
-                    "index": idx,
-                    "length": len(val),
-                })
-                self.add_flag(idx, col, "TEXT-05",
-                             f"Extremely long text ({len(val)} chars) — possible paste error",
-                             f"{val[:100]}...", severity="warning")
-                result.rows_flagged += 1
-        
-        if long_values:
-            result.details["long_values"] = long_values
-            result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            str_col = self.df.loc[str_mask, col]
+            lengths = str_col.str.len()
+            long_mask = lengths > MAX_TEXT_LENGTH
+            if long_mask.any():
+                long_vals = str_col[long_mask]
+                long_lengths = lengths[long_mask]
+                long_values = []
+                for idx in long_vals.index:
+                    v = long_vals.at[idx]
+                    ln = int(long_lengths.at[idx])
+                    long_values.append({"index": idx, "length": ln})
+                    self.add_flag(idx, col, "TEXT-05",
+                                 f"Extremely long text ({ln} chars) — possible paste error",
+                                 f"{v[:100]}...", severity="warning")
+                    result.rows_flagged += 1
+                result.details["long_values"] = long_values
+                result.was_auto_applied = False
+                self.log_cleaning(result)
         return result
     
     def TEXT_06_sentiment_tagging(self, col: str) -> CleaningResult:
@@ -799,60 +802,48 @@ class TextTechnicalRules:
     def TEXT_08_language_detection(self, col: str) -> CleaningResult:
         """TEXT-08: Detect unexpected languages in text."""
         result = CleaningResult(column=col, formula_id="TEXT-08")
-        
-        language_counts = Counter()
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if not str_mask.any():
+            return result
+        str_col = self.df.loc[str_mask, col]
+        langs = str_col.apply(detect_language)
+        has_lang = langs.notna()
+        if not has_lang.any():
+            return result
+        language_counts = Counter(langs[has_lang].tolist())
+        dominant_lang = language_counts.most_common(1)[0][0]
+        self.language_stats[col] = dict(language_counts)
+        anomaly_mask = has_lang & (langs != dominant_lang)
         anomalies = []
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            lang = detect_language(val)
-            if lang:
-                language_counts[lang] += 1
-        
-        # Find dominant language
-        if language_counts:
-            dominant_lang = language_counts.most_common(1)[0][0]
-            self.language_stats[col] = dict(language_counts)
-            
-            # Flag non-dominant languages
-            for idx, val in self.df[col].items():
-                if pd.isna(val) or not isinstance(val, str):
-                    continue
-                
-                lang = detect_language(val)
-                if lang and lang != dominant_lang:
-                    anomalies.append((idx, lang))
-                    self.add_flag(idx, col, "TEXT-08",
-                                 f"Unexpected language ({lang}) in predominantly {dominant_lang} column",
-                                 val[:100], severity="info")
-                    result.rows_flagged += 1
-        
-        if language_counts:
-            result.details["language_distribution"] = dict(language_counts)
-            result.details["anomalies_found"] = len(anomalies)
-            if anomalies:
-                result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        for idx in anomaly_mask[anomaly_mask].index:
+            lang = langs.at[idx]
+            val = str_col.at[idx]
+            anomalies.append((idx, lang))
+            self.add_flag(idx, col, "TEXT-08",
+                         f"Unexpected language ({lang}) in predominantly {dominant_lang} column",
+                         str(val)[:100], severity="info")
+            result.rows_flagged += 1
+        result.details["language_distribution"] = dict(language_counts)
+        result.details["anomalies_found"] = len(anomalies)
+        if anomalies:
+            result.was_auto_applied = False
+        self.log_cleaning(result)
         return result
     
     def TEXT_09_leading_apostrophe_removal(self, col: str) -> CleaningResult:
         """TEXT-09: Remove leading apostrophe from Excel-exported text."""
         result = CleaningResult(column=col, formula_id="TEXT-09")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if val.startswith("'") and len(val) > 1:
-                self.df.at[idx, col] = val[1:]
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            starts_apos = (
+                self.df.loc[str_mask, col].str.startswith("'")
+                & (self.df.loc[str_mask, col].str.len() > 1)
+            )
+            if starts_apos.any():
+                update_idx = starts_apos[starts_apos].index
+                self.df.loc[update_idx, col] = self.df.loc[update_idx, col].str[1:]
+                result.changes_made = int(starts_apos.sum())
+                self.log_cleaning(result)
         return result
     
     # ========================================================================
@@ -862,117 +853,83 @@ class TextTechnicalRules:
     def URL_01_protocol_normalization(self, col: str) -> CleaningResult:
         """URL-01: Add https:// protocol if missing."""
         result = CleaningResult(column=col, formula_id="URL-01")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            normalized = normalize_url_protocol(val.strip())
-            if normalized != val.strip():
-                self.df.at[idx, col] = normalized
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
+        new_series, n = self._vec_str(col, lambda v: normalize_url_protocol(v.strip()))
+        if n:
+            self.df[col] = new_series
+            result.changes_made = n
             self.log_cleaning(result)
-        
         return result
     
     def URL_02_lowercase_domain(self, col: str) -> CleaningResult:
         """URL-02: Lowercase the domain portion."""
         result = CleaningResult(column=col, formula_id="URL-02")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            lowercased = lowercase_domain(val)
-            if lowercased != val:
-                self.df.at[idx, col] = lowercased
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
+        new_series, n = self._vec_str(col, lowercase_domain)
+        if n:
+            self.df[col] = new_series
+            result.changes_made = n
             self.log_cleaning(result)
-        
         return result
     
     def URL_03_trailing_slash_standardization(self, col: str) -> CleaningResult:
         """URL-03: Standardize trailing slash presence."""
         result = CleaningResult(column=col, formula_id="URL-03")
-        
-        # Count URLs with and without trailing slash
-        with_slash = 0
-        without_slash = 0
-        
-        for val in self.df[col].dropna():
-            if isinstance(val, str):
-                val = val.strip()
-                # Only consider URLs without query params
-                if '?' not in val:
-                    if val.endswith('/'):
-                        with_slash += 1
-                    else:
-                        without_slash += 1
-        
-        # Standardize to majority format
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if not str_mask.any():
+            return result
+        # Count with/without slash (no-query URLs only)
+        stripped = self.df.loc[str_mask, col].str.strip()
+        no_query = ~stripped.str.contains('?', regex=False)
+        with_slash = int((no_query & stripped.str.endswith('/')).sum())
+        without_slash = int((no_query & ~stripped.str.endswith('/')).sum())
         add_slash = with_slash > without_slash
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            val = val.strip()
-            if '?' not in val:  # Don't modify URLs with query params
-                if add_slash and not val.endswith('/'):
-                    self.df.at[idx, col] = val + '/'
-                    result.changes_made += 1
-                elif not add_slash and val.endswith('/'):
-                    self.df.at[idx, col] = val.rstrip('/')
-                    result.changes_made += 1
-        
+        # Batch-apply to matching rows
+        if add_slash:
+            needs_change = no_query & ~stripped.str.endswith('/')
+            if needs_change.any():
+                update_idx = needs_change[needs_change].index
+                self.df.loc[update_idx, col] = stripped.loc[update_idx] + '/'
+                result.changes_made = int(needs_change.sum())
+        else:
+            needs_change = no_query & stripped.str.endswith('/')
+            if needs_change.any():
+                update_idx = needs_change[needs_change].index
+                self.df.loc[update_idx, col] = stripped.loc[update_idx].str.rstrip('/')
+                result.changes_made = int(needs_change.sum())
         if result.changes_made > 0:
             result.details["standardized_to"] = "with_slash" if add_slash else "without_slash"
             self.log_cleaning(result)
-        
         return result
     
     def URL_04_format_validation(self, col: str) -> CleaningResult:
         """URL-04: Validate URL format."""
         result = CleaningResult(column=col, formula_id="URL-04")
-        
-        invalid_urls = []
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if not is_valid_url(val):
-                invalid_urls.append((idx, val))
-                self.add_flag(idx, col, "URL-04",
-                             "Invalid URL format", val, severity="error")
-                result.rows_flagged += 1
-        
-        if invalid_urls:
-            result.details["invalid_count"] = len(invalid_urls)
-            result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            str_col = self.df.loc[str_mask, col]
+            invalid_mask = ~str_col.apply(is_valid_url)
+            if invalid_mask.any():
+                invalid_urls = str_col[invalid_mask]
+                for idx in invalid_urls.index:
+                    val = invalid_urls.at[idx]
+                    self.add_flag(idx, col, "URL-04",
+                                 "Invalid URL format", val, severity="error")
+                    result.rows_flagged += 1
+                result.details["invalid_count"] = int(invalid_mask.sum())
+                result.was_auto_applied = False
+                self.log_cleaning(result)
         return result
     
     def URL_05_placeholder_detection(self, col: str) -> CleaningResult:
         """URL-05: Detect placeholder URLs."""
         result = CleaningResult(column=col, formula_id="URL-05")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if is_placeholder_url(val):
-                self.df.at[idx, col] = None
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            placeholder_mask = self.df.loc[str_mask, col].apply(is_placeholder_url)
+            if placeholder_mask.any():
+                update_idx = placeholder_mask[placeholder_mask].index
+                self.df.loc[update_idx, col] = None
+                result.changes_made = int(placeholder_mask.sum())
+                self.log_cleaning(result)
         return result
     
     # ========================================================================
@@ -982,71 +939,59 @@ class TextTechnicalRules:
     def IP_01_format_validation(self, col: str) -> CleaningResult:
         """IP-01: Validate IPv4/IPv6 format."""
         result = CleaningResult(column=col, formula_id="IP-01")
-        
-        invalid_ips = []
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if not is_valid_ip(val):
-                invalid_ips.append((idx, val))
-                self.add_flag(idx, col, "IP-01",
-                             "Invalid IP address format", val, severity="error")
-                result.rows_flagged += 1
-        
-        if invalid_ips:
-            result.details["invalid_count"] = len(invalid_ips)
-            result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            str_col = self.df.loc[str_mask, col]
+            invalid_mask = ~str_col.apply(is_valid_ip)
+            if invalid_mask.any():
+                invalid_ips = str_col[invalid_mask]
+                for idx in invalid_ips.index:
+                    val = invalid_ips.at[idx]
+                    self.add_flag(idx, col, "IP-01",
+                                 "Invalid IP address format", val, severity="error")
+                    result.rows_flagged += 1
+                result.details["invalid_count"] = int(invalid_mask.sum())
+                result.was_auto_applied = False
+                self.log_cleaning(result)
         return result
     
     def IP_02_private_ip_flagging(self, col: str) -> CleaningResult:
         """IP-02: Flag private/internal IP addresses."""
         result = CleaningResult(column=col, formula_id="IP-02")
-        
-        private_count = 0
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            ip = parse_ip_address(val)
-            if ip and is_private_ip(ip):
-                private_count += 1
-                self.add_flag(idx, col, "IP-02",
-                             "Private/internal IP address", val, severity="info")
-                result.rows_flagged += 1
-        
-        if private_count > 0:
-            result.details["private_ip_count"] = private_count
-            result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            str_col = self.df.loc[str_mask, col]
+            parsed = str_col.apply(parse_ip_address)
+            private_mask = parsed.apply(lambda ip: bool(ip and is_private_ip(ip)))
+            if private_mask.any():
+                private_vals = str_col[private_mask]
+                for idx in private_vals.index:
+                    val = private_vals.at[idx]
+                    self.add_flag(idx, col, "IP-02",
+                                 "Private/internal IP address", val, severity="info")
+                    result.rows_flagged += 1
+                result.details["private_ip_count"] = int(private_mask.sum())
+                result.was_auto_applied = False
+                self.log_cleaning(result)
         return result
     
     def IP_03_loopback_detection(self, col: str) -> CleaningResult:
         """IP-03: Detect loopback addresses (127.0.0.1, ::1)."""
         result = CleaningResult(column=col, formula_id="IP-03")
-        
-        loopback_count = 0
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if is_loopback_ip(val):
-                loopback_count += 1
-                self.add_flag(idx, col, "IP-03",
-                             "Loopback address — likely test data", val, severity="warning")
-                result.rows_flagged += 1
-        
-        if loopback_count > 0:
-            result.details["loopback_count"] = loopback_count
-            result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            str_col = self.df.loc[str_mask, col]
+            loopback_mask = str_col.apply(is_loopback_ip)
+            if loopback_mask.any():
+                loopback_vals = str_col[loopback_mask]
+                for idx in loopback_vals.index:
+                    val = loopback_vals.at[idx]
+                    self.add_flag(idx, col, "IP-03",
+                                 "Loopback address — likely test data", val, severity="warning")
+                    result.rows_flagged += 1
+                result.details["loopback_count"] = int(loopback_mask.sum())
+                result.was_auto_applied = False
+                self.log_cleaning(result)
         return result
     
     def IP_04_duplicate_ip_alert(self, col: str) -> CleaningResult:
@@ -1111,67 +1056,58 @@ class TextTechnicalRules:
     def FILE_01_extension_validation(self, col: str) -> CleaningResult:
         """FILE-01: Validate file extension is known."""
         result = CleaningResult(column=col, formula_id="FILE-01")
-        
-        unknown_extensions = Counter()
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            ext = get_file_extension(val)
-            if ext and not is_known_extension(ext):
-                unknown_extensions[ext] += 1
-                self.add_flag(idx, col, "FILE-01",
-                             f"Unknown file extension: .{ext}", val, severity="info")
-                result.rows_flagged += 1
-        
-        if unknown_extensions:
-            result.details["unknown_extensions"] = dict(unknown_extensions)
-            result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        unknown_extensions: Counter = Counter()
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            str_col = self.df.loc[str_mask, col]
+            exts = str_col.apply(get_file_extension)
+            unknown_mask = exts.apply(lambda e: bool(e and not is_known_extension(e)))
+            if unknown_mask.any():
+                for idx in unknown_mask[unknown_mask].index:
+                    ext = exts.at[idx]
+                    val = str_col.at[idx]
+                    unknown_extensions[ext] += 1
+                    self.add_flag(idx, col, "FILE-01",
+                                 f"Unknown file extension: .{ext}", val, severity="info")
+                    result.rows_flagged += 1
+                result.details["unknown_extensions"] = dict(unknown_extensions)
+                result.was_auto_applied = False
+                self.log_cleaning(result)
         return result
     
     def FILE_02_path_separator_normalization(self, col: str) -> CleaningResult:
         """FILE-02: Normalize path separators to forward slash."""
         result = CleaningResult(column=col, formula_id="FILE-02")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if '\\' in val:
-                normalized = normalize_path_separator(val)
-                self.df.at[idx, col] = normalized
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            has_backslash = self.df.loc[str_mask, col].str.contains('\\\\', regex=False)
+            if has_backslash.any():
+                update_idx = has_backslash[has_backslash].index
+                self.df.loc[update_idx, col] = (
+                    self.df.loc[update_idx, col].str.replace('\\\\', '/', regex=False)
+                )
+                result.changes_made = int(has_backslash.sum())
+                self.log_cleaning(result)
         return result
     
     def FILE_03_special_character_alert(self, col: str) -> CleaningResult:
         """FILE-03: Flag filenames with unsafe characters."""
         result = CleaningResult(column=col, formula_id="FILE-03")
-        
-        unsafe_files = []
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            if has_unsafe_filename_chars(val):
-                unsafe_files.append((idx, val))
-                self.add_flag(idx, col, "FILE-03",
-                             "Filename contains spaces or special characters", val,
-                             severity="warning")
-                result.rows_flagged += 1
-        
-        if unsafe_files:
-            result.details["unsafe_count"] = len(unsafe_files)
-            result.was_auto_applied = False
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            str_col = self.df.loc[str_mask, col]
+            unsafe_mask = str_col.apply(has_unsafe_filename_chars)
+            if unsafe_mask.any():
+                unsafe_vals = str_col[unsafe_mask]
+                for idx in unsafe_vals.index:
+                    val = unsafe_vals.at[idx]
+                    self.add_flag(idx, col, "FILE-03",
+                                 "Filename contains spaces or special characters", val,
+                                 severity="warning")
+                    result.rows_flagged += 1
+                result.details["unsafe_count"] = int(unsafe_mask.sum())
+                result.was_auto_applied = False
+                self.log_cleaning(result)
         return result
     
     def FILE_04_null_handling(self, col: str) -> CleaningResult:

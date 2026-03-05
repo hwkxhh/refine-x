@@ -245,14 +245,17 @@ def normalize_boolean(value: Any) -> Optional[bool]:
     """Convert various boolean representations to Python bool.
     
     Args:
-        value: Input value (string, int, bool, etc.)
+        value: Input value (string, int, bool, numpy scalar, etc.)
         
     Returns:
         True, False, or None if not parseable as boolean
     """
-    if value is None or pd.isna(value):
+    # Guard: convert numpy scalars / pandas NaT to Python natives first
+    from app.utils.value_safety import to_native, is_null
+    value = to_native(value)
+    if is_null(value):
         return None
-    
+
     if isinstance(value, bool):
         return value
     
@@ -278,18 +281,16 @@ def is_non_binary_value(value: Any) -> bool:
     """Check if value is non-binary (should be Status instead of Boolean).
     
     Args:
-        value: Input value
+        value: Input value (any type — guarded)
         
     Returns:
         True if value represents a non-binary state
     """
-    if value is None or pd.isna(value):
+    from app.utils.value_safety import to_str
+    s = to_str(value)
+    if s is None:
         return False
-    
-    if isinstance(value, str):
-        return value.strip().lower() in NON_BINARY_VALUES
-    
-    return False
+    return s.strip().lower() in NON_BINARY_VALUES
 
 
 def detect_boolean_column(series: pd.Series) -> Tuple[bool, float]:
@@ -500,15 +501,16 @@ def normalize_status(value: str) -> Optional[str]:
     """Normalize status value to canonical form.
     
     Args:
-        value: Input status string
+        value: Input status value (any type — guarded)
         
     Returns:
         Canonical status or None
     """
-    if not value:
+    from app.utils.value_safety import to_str
+    val_str = to_str(value)
+    if val_str is None:
         return None
-    
-    val_lower = value.strip().lower()
+    val_lower = val_str.strip().lower()
     return STATUS_MAPPINGS.get(val_lower)
 
 
@@ -672,10 +674,12 @@ def verbal_to_numeric_likert(value: str, scale_mapping: Dict[str, int]) -> Optio
     Returns:
         Numeric value or None
     """
-    if not value or not scale_mapping:
+    from app.utils.value_safety import to_str
+    val_str = to_str(value)
+    if val_str is None or not scale_mapping:
         return None
-    
-    val_lower = value.strip().lower()
+
+    val_lower = val_str.strip().lower()
     
     # First check for typos
     if val_lower in LIKERT_TYPOS:
@@ -684,26 +688,28 @@ def verbal_to_numeric_likert(value: str, scale_mapping: Dict[str, int]) -> Optio
     return scale_mapping.get(val_lower)
 
 
-def fix_likert_typo(value: str) -> Tuple[str, bool]:
+def fix_likert_typo(value: Any) -> Tuple[str, bool]:
     """Fix common Likert scale typos.
     
     Args:
-        value: Input value
+        value: Input value (any type — guarded)
         
     Returns:
         Tuple of (fixed_value, was_typo)
     """
-    if not value:
+    from app.utils.value_safety import to_str
+    val_str = to_str(value)
+    if val_str is None:
         return value, False
     
-    val_lower = value.strip().lower()
+    val_lower = val_str.strip().lower()
     
     if val_lower in LIKERT_TYPOS:
         fixed = LIKERT_TYPOS[val_lower]
         # Return in title case
         return fixed.title(), True
     
-    return value, False
+    return val_str, False
 
 
 def detect_straight_lining(df: pd.DataFrame, 
@@ -1056,6 +1062,28 @@ class BooleanCategoryRules:
         """Ensure column has object dtype for mixed type assignment (pandas 3.0 compatibility)."""
         if col in self.df.columns and self.df[col].dtype in ['string', 'object']:
             self.df[col] = self.df[col].astype(object)
+
+    def _vec_str(self, col: str, func, str_only: bool = True):
+        """
+        Apply *func* to every non-null (optionally str-only) value in *col*
+        via vectorised pandas .apply(), then batch-assign changed cells.
+
+        Returns (new_series, changes_made: int).
+        ~10× faster than per-cell df.at[] writes inside a Python for-loop.
+        """
+        if str_only:
+            mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        else:
+            mask = self.df[col].notna()
+        if not mask.any():
+            return self.df[col].copy(), 0
+        orig = self.df.loc[mask, col]
+        new_vals = orig.apply(func)
+        changed = new_vals != orig
+        out = self.df[col].copy()
+        if changed.any():
+            out.loc[new_vals[changed].index] = new_vals[changed]
+        return out, int(changed.sum())
     
     def add_flag(self, row_idx: int, col: str, formula_id: str,
                  message: str, value: Any, severity: str = "warning"):
@@ -1103,50 +1131,60 @@ class BooleanCategoryRules:
         """BOOL-01: Standardize boolean values to True/False."""
         result = CleaningResult(column=col, formula_id="BOOL-01")
         self._ensure_object_dtype(col)
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val):
-                continue
-            
-            normalized = normalize_boolean(val)
-            if normalized is not None:
-                # Only count as change if different
-                if str(val).lower().strip() not in ("true", "false"):
-                    self.df.at[idx, col] = normalized
-                    result.changes_made += 1
-            elif is_non_binary_value(val):
-                # Non-binary value - flag for review
+
+        mask = self.df[col].notna()
+        if not mask.any():
+            return result
+
+        orig = self.df.loc[mask, col].copy()
+        normalized = orig.apply(normalize_boolean)
+
+        # Rows that need updating: normalize succeeded AND value wasn't already True/False
+        already_canonical = orig.apply(
+            lambda v: isinstance(v, bool)
+            or (isinstance(v, str) and v.lower().strip() in ("true", "false"))
+        )
+        should_update = normalized.notna() & ~already_canonical
+        if should_update.any():
+            update_idx = should_update[should_update].index
+            self.df.loc[update_idx, col] = normalized.loc[update_idx]
+            result.changes_made = int(should_update.sum())
+
+        # Non-binary flags: normalize returned None and wasn't already canonical
+        flag_candidates = orig[normalized.isna() & ~already_canonical]
+        for idx in flag_candidates.index:
+            val = flag_candidates[idx]
+            if is_non_binary_value(val):
                 self.add_flag(idx, col, "BOOL-01",
-                             f"Non-binary value in boolean field: {val}", val)
+                              f"Non-binary value in boolean field: {val}", val)
                 result.rows_flagged += 1
-        
+
         if result.changes_made > 0 or result.rows_flagged > 0:
             self.log_cleaning(result)
-        
         return result
     
     def BOOL_02_binary_enforcement(self, col: str) -> CleaningResult:
         """BOOL-02: Flag non-binary values (suggest reroute to Status)."""
         result = CleaningResult(column=col, formula_id="BOOL-02")
-        
+
+        mask = self.df[col].notna()
+        if not mask.any():
+            return result
+
+        non_binary_flags = self.df.loc[mask, col].apply(is_non_binary_value)
         non_binary_found = []
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val):
-                continue
-            
-            if is_non_binary_value(val):
-                non_binary_found.append(val)
-                self.add_flag(idx, col, "BOOL-02",
-                             f"Non-binary value suggests Status field: {val}", val)
-                result.rows_flagged += 1
-        
+        for idx in non_binary_flags[non_binary_flags].index:
+            val = self.df.at[idx, col]
+            non_binary_found.append(val)
+            self.add_flag(idx, col, "BOOL-02",
+                          f"Non-binary value suggests Status field: {val}", val)
+            result.rows_flagged += 1
+
         if non_binary_found:
             result.details["non_binary_values"] = list(set(str(v) for v in non_binary_found))
             result.details["suggestion"] = "Consider reclassifying as HTYPE-020 (Status)"
             result.was_auto_applied = False
             self.log_cleaning(result)
-        
         return result
     
     def BOOL_03_null_distinction(self, col: str) -> CleaningResult:
@@ -1198,72 +1236,54 @@ class BooleanCategoryRules:
     def CAT_01_title_case_normalization(self, col: str) -> CleaningResult:
         """CAT-01: Apply title case to categories."""
         result = CleaningResult(column=col, formula_id="CAT-01")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            title_cased = to_title_case(val.strip())
-            if title_cased != val:
-                self.df.at[idx, col] = title_cased
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
+        new_series, changes = self._vec_str(col, lambda v: to_title_case(v.strip()))
+        if changes > 0:
+            self.df[col] = new_series
+            result.changes_made = changes
             self.log_cleaning(result)
-        
         return result
     
     def CAT_02_variant_consolidation(self, col: str) -> CleaningResult:
         """CAT-02: Consolidate case/punctuation variants."""
         result = CleaningResult(column=col, formula_id="CAT-02")
-        
-        # Build variant map
-        unique_vals = set()
-        for val in self.df[col].dropna():
-            if isinstance(val, str):
-                unique_vals.add(val)
-        
+
+        str_vals = self.df[col].dropna()
+        str_vals = str_vals[str_vals.apply(lambda x: isinstance(x, str))]
+        unique_vals = set(str_vals)
+
         # Group by lowercase
-        groups = defaultdict(list)
+        groups: dict = defaultdict(list)
         for val in unique_vals:
             groups[val.lower().strip()].append(val)
-        
-        # Find groups with variants
+
         variant_groups = {k: v for k, v in groups.items() if len(v) > 1}
-        
+
         if variant_groups:
-            # Build canonical map - use most frequent variant
+            # Use pandas value_counts() for frequency — O(n) not O(n*variants)
+            val_counts = self.df[col].value_counts()
             canonical_map = {}
             for key, variants in variant_groups.items():
-                # Count occurrences of each variant
-                counts = {}
-                for v in variants:
-                    counts[v] = sum(1 for x in self.df[col] 
-                                   if not pd.isna(x) and x == v)
-                
-                # Use most frequent as canonical
-                canonical = max(counts, key=counts.get)
-                canonical_map[key] = canonical
-            
+                counts = {v: int(val_counts.get(v, 0)) for v in variants}
+                canonical_map[key] = max(counts, key=counts.get)
+
             self.category_canonical[col] = canonical_map
-            
-            # Apply consolidation
-            for idx, val in self.df[col].items():
-                if pd.isna(val) or not isinstance(val, str):
-                    continue
-                
-                key = val.lower().strip()
-                if key in canonical_map and val != canonical_map[key]:
-                    self.df.at[idx, col] = canonical_map[key]
-                    result.changes_made += 1
-            
-            result.details["variant_groups"] = {
-                k: v for k, v in variant_groups.items()
-            }
-        
+
+            # Apply via vectorised map: lowercase → canonical
+            str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+            if str_mask.any():
+                lower_vals = self.df.loc[str_mask, col].str.lower().str.strip()
+                new_vals = lower_vals.map(canonical_map)
+                orig = self.df.loc[str_mask, col]
+                changed = new_vals.notna() & (new_vals != orig)
+                if changed.any():
+                    update_idx = changed[changed].index
+                    self.df.loc[update_idx, col] = new_vals.loc[update_idx]
+                    result.changes_made = int(changed.sum())
+
+            result.details["variant_groups"] = {k: v for k, v in variant_groups.items()}
+
         if result.changes_made > 0:
             self.log_cleaning(result)
-        
         return result
     
     def CAT_03_typo_correction(self, col: str) -> CleaningResult:
@@ -1309,23 +1329,18 @@ class BooleanCategoryRules:
     def CAT_04_rare_category_flagging(self, col: str) -> CleaningResult:
         """CAT-04: Flag categories appearing in <1% of rows."""
         result = CleaningResult(column=col, formula_id="CAT-04")
-        
         rare_cats = detect_rare_categories(self.df[col], threshold=0.01)
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val):
-                continue
-            
-            if val in rare_cats:
-                self.add_flag(idx, col, "CAT-04",
-                             f"Rare category (<1%): {val}", val, severity="info")
-                result.rows_flagged += 1
-        
         if rare_cats:
+            rare_set = set(rare_cats)
+            rare_mask = self.df[col].notna() & self.df[col].isin(rare_set)
+            for idx in rare_mask[rare_mask].index:
+                val = self.df.at[idx, col]
+                self.add_flag(idx, col, "CAT-04",
+                              f"Rare category (<1%): {val}", val, severity="info")
+                result.rows_flagged += 1
             result.details["rare_categories"] = rare_cats
             result.was_auto_applied = False
             self.log_cleaning(result)
-        
         return result
     
     def CAT_05_frequency_report(self, col: str) -> CleaningResult:
@@ -1365,37 +1380,26 @@ class BooleanCategoryRules:
     def CAT_07_whitespace_normalization(self, col: str) -> CleaningResult:
         """CAT-07: Clean whitespace in category values."""
         result = CleaningResult(column=col, formula_id="CAT-07")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            cleaned = clean_category_whitespace(val)
-            if cleaned != val:
-                self.df.at[idx, col] = cleaned
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            orig = self.df.loc[str_mask, col]
+            new_vals = orig.str.strip().str.replace(r'\s+', ' ', regex=True)
+            changed = new_vals != orig
+            if changed.any():
+                update_idx = changed[changed].index
+                self.df.loc[update_idx, col] = new_vals.loc[update_idx]
+                result.changes_made = int(changed.sum())
+                self.log_cleaning(result)
         return result
     
     def CAT_08_encoding_artifact_fix(self, col: str) -> CleaningResult:
         """CAT-08: Fix encoding artifacts in text."""
         result = CleaningResult(column=col, formula_id="CAT-08")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            fixed = fix_encoding_artifacts(val)
-            if fixed != val:
-                self.df.at[idx, col] = fixed
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
+        new_series, changes = self._vec_str(col, fix_encoding_artifacts)
+        if changes > 0:
+            self.df[col] = new_series
+            result.changes_made = changes
             self.log_cleaning(result)
-        
         return result
     
     # ========================================================================
@@ -1405,23 +1409,19 @@ class BooleanCategoryRules:
     def STAT_01_canonical_mapping(self, col: str) -> CleaningResult:
         """STAT-01: Map status variants to canonical form."""
         result = CleaningResult(column=col, formula_id="STAT-01")
-        
-        mappings_applied = {}
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            canonical = normalize_status(val)
-            if canonical and canonical != val:
-                mappings_applied[val] = canonical
-                self.df.at[idx, col] = canonical
-                result.changes_made += 1
-        
-        if mappings_applied:
-            result.details["mappings_applied"] = mappings_applied
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            orig = self.df.loc[str_mask, col]
+            lower_vals = orig.str.strip().str.lower()
+            canonical = lower_vals.map(STATUS_MAPPINGS)
+            changed = canonical.notna() & (canonical != orig)
+            if changed.any():
+                update_idx = changed[changed].index
+                mappings_applied = dict(zip(orig.loc[update_idx], canonical.loc[update_idx]))
+                self.df.loc[update_idx, col] = canonical.loc[update_idx]
+                result.changes_made = int(changed.sum())
+                result.details["mappings_applied"] = mappings_applied
+                self.log_cleaning(result)
         return result
     
     def STAT_02_workflow_validation(self, col: str) -> CleaningResult:
@@ -1454,34 +1454,26 @@ class BooleanCategoryRules:
     def STAT_03_case_normalization(self, col: str) -> CleaningResult:
         """STAT-03: Normalize status to title case."""
         result = CleaningResult(column=col, formula_id="STAT-03")
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            # Title case but preserve known patterns
-            title_cased = val.strip().title()
-            if title_cased != val:
-                self.df.at[idx, col] = title_cased
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            orig = self.df.loc[str_mask, col]
+            new_vals = orig.str.strip().str.title()
+            changed = new_vals != orig
+            if changed.any():
+                update_idx = changed[changed].index
+                self.df.loc[update_idx, col] = new_vals.loc[update_idx]
+                result.changes_made = int(changed.sum())
+                self.log_cleaning(result)
         return result
     
     def STAT_04_null_handling(self, col: str) -> CleaningResult:
         """STAT-04: Handle null status values."""
         result = CleaningResult(column=col, formula_id="STAT-04")
-        
-        null_indices = []
-        for idx, val in self.df[col].items():
-            if pd.isna(val):
-                null_indices.append(idx)
-                self.add_flag(idx, col, "STAT-04",
-                             "Missing status value", None, severity="info")
-        
+        null_indices = self.df.index[self.df[col].isna()].tolist()
         if null_indices:
+            for idx in null_indices:
+                self.add_flag(idx, col, "STAT-04",
+                              "Missing status value", None, severity="info")
             result.rows_flagged = len(null_indices)
             result.details["null_count"] = len(null_indices)
             result.details["options"] = [
@@ -1491,7 +1483,6 @@ class BooleanCategoryRules:
             ]
             result.was_auto_applied = False
             self.log_cleaning(result)
-        
         return result
     
     def STAT_05_retired_status_detection(self, col: str) -> CleaningResult:
@@ -1535,76 +1526,68 @@ class BooleanCategoryRules:
         """SURV-02: Convert verbal responses to numeric."""
         result = CleaningResult(column=col, formula_id="SURV-02")
         self._ensure_object_dtype(col)
-        
+
         if col not in self.detected_scales:
             scale_type, scale_size, mapping = detect_likert_scale(self.df[col])
             self.detected_scales[col] = (scale_type, scale_size, mapping)
         else:
             scale_type, scale_size, mapping = self.detected_scales[col]
-        
+
         if not mapping:
             return result
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            numeric = verbal_to_numeric_likert(val, mapping)
-            if numeric is not None:
-                self.df.at[idx, col] = numeric
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            result.details["scale_used"] = scale_type
-            self.log_cleaning(result)
-        
+
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            lower_vals = self.df.loc[str_mask, col].str.strip().str.lower()
+            # Apply typo corrections first
+            lower_vals = lower_vals.map(lambda v: LIKERT_TYPOS.get(v, v))
+            numeric = lower_vals.map(mapping)
+            changed = numeric.notna()
+            if changed.any():
+                update_idx = changed[changed].index
+                self.df.loc[update_idx, col] = numeric.loc[update_idx]
+                result.changes_made = int(changed.sum())
+                result.details["scale_used"] = scale_type
+                self.log_cleaning(result)
         return result
     
     def SURV_03_variant_standardization(self, col: str) -> CleaningResult:
         """SURV-03: Fix typos in Likert scale values."""
         result = CleaningResult(column=col, formula_id="SURV-03")
-        
-        corrections = {}
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            fixed, was_typo = fix_likert_typo(val)
-            if was_typo:
-                corrections[val] = fixed
-                self.df.at[idx, col] = fixed
-                result.changes_made += 1
-        
-        if corrections:
-            result.details["corrections"] = corrections
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            orig = self.df.loc[str_mask, col]
+            lower_vals = orig.str.strip().str.lower()
+            fixed = lower_vals.map(LIKERT_TYPOS)  # NaN where not a typo
+            changed = fixed.notna()
+            if changed.any():
+                update_idx = changed[changed].index
+                # Title-case the fixed values
+                fixed_titled = fixed.loc[update_idx].str.title()
+                corrections = dict(zip(orig.loc[update_idx], fixed_titled))
+                self.df.loc[update_idx, col] = fixed_titled
+                result.changes_made = int(changed.sum())
+                result.details["corrections"] = corrections
+                self.log_cleaning(result)
         return result
     
     def SURV_04_frequency_scale_mapping(self, col: str) -> CleaningResult:
         """SURV-04: Map frequency responses (Never/Rarely/.../Always) to numeric."""
         result = CleaningResult(column=col, formula_id="SURV-04")
         self._ensure_object_dtype(col)
-        
-        for idx, val in self.df[col].items():
-            if pd.isna(val) or not isinstance(val, str):
-                continue
-            
-            val_lower = val.strip().lower()
-            
-            # Check for typos first
-            if val_lower in LIKERT_TYPOS:
-                val_lower = LIKERT_TYPOS[val_lower]
-            
-            if val_lower in FREQUENCY_SCALE:
-                self.df.at[idx, col] = FREQUENCY_SCALE[val_lower]
-                result.changes_made += 1
-        
-        if result.changes_made > 0:
-            result.details["scale"] = "frequency (1-5)"
-            self.log_cleaning(result)
-        
+        str_mask = self.df[col].notna() & self.df[col].apply(lambda x: isinstance(x, str))
+        if str_mask.any():
+            lower_vals = self.df.loc[str_mask, col].str.strip().str.lower()
+            # Apply typo corrections first
+            lower_vals = lower_vals.map(lambda v: LIKERT_TYPOS.get(v, v))
+            numeric = lower_vals.map(FREQUENCY_SCALE)
+            changed = numeric.notna()
+            if changed.any():
+                update_idx = changed[changed].index
+                self.df.loc[update_idx, col] = numeric.loc[update_idx]
+                result.changes_made = int(changed.sum())
+                result.details["scale"] = "frequency (1-5)"
+                self.log_cleaning(result)
         return result
     
     def SURV_05_out_of_range_flag(self, col: str) -> CleaningResult:

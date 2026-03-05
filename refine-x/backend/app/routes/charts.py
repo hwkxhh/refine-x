@@ -21,6 +21,7 @@ from app.services.ai_recommendations import recommend_headers
 from app.services.auth import get_current_user
 from app.services.cache import get_cached_dataframe
 from app.services.chart_engine import ChartEngine
+from app.services.chart_suite import generate_full_chart_suite
 
 router = APIRouter(prefix="/jobs", tags=["charts"])
 
@@ -97,6 +98,7 @@ def get_recommendations(
             column_names=df.columns.tolist(),
             data_sample=sample,
             user_goal=goal.goal_text,
+            df=df,
         )
     except (RateLimitError, AuthenticationError, APIStatusError):
         # GPT quota exhausted — return empty list gracefully
@@ -121,24 +123,139 @@ def generate_chart(
     if payload.y_col and payload.y_col not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{payload.y_col}' not found in dataset")
 
+    # Prevent nonsense same-column charts (e.g. "Year vs Year")
+    y_col = None if payload.y_col == payload.x_col else payload.y_col
+
+    # Validate group_by column exists
+    group_by = payload.group_by if (payload.group_by and payload.group_by in df.columns) else None
+
     engine = ChartEngine(df)
-    chart_type = engine.determine_chart_type(payload.x_col, payload.y_col)
-    chart_payload = engine.generate_chart_data(payload.x_col, payload.y_col, chart_type)
+    chart_type = engine.determine_chart_type(payload.x_col, y_col, group_by=group_by)
+    chart_payload = engine.generate_chart_data(payload.x_col, y_col, chart_type, group_by=group_by)
+
+    config = {
+        "xLabel": chart_payload["xLabel"],
+        "yLabel": chart_payload["yLabel"],
+        "xDomain": chart_payload.get("xDomain"),
+        "yDomain": chart_payload.get("yDomain"),
+        "grouped": chart_payload.get("grouped", False),
+        "series_keys": chart_payload.get("series_keys"),
+        "group_by": group_by,
+        "note": chart_payload.get("note"),
+        "layout": chart_payload.get("layout"),
+        "data_key": chart_payload.get("data_key", "y"),
+        "x_data_key": chart_payload.get("x_data_key", "x"),
+        "y_unit": chart_payload.get("y_unit", "plain"),
+    }
 
     chart = Chart(
         job_id=job_id,
         chart_type=chart_type,
         x_header=payload.x_col,
-        y_header=payload.y_col,
+        y_header=y_col,
         title=chart_payload["title"],
         data=chart_payload["data"],
-        config={"xLabel": chart_payload["xLabel"], "yLabel": chart_payload["yLabel"]},
+        config=config,
+        reason=payload.reason,
         is_recommended=payload.is_recommended,
     )
     db.add(chart)
     db.commit()
     db.refresh(chart)
     return chart
+
+
+# ── Auto-generate full chart suite ────────────────────────────────────────────
+
+@router.post("/{job_id}/charts/auto", response_model=list[ChartResponse], status_code=201)
+def auto_generate_charts(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Automatically generate a full analyst-grade chart suite for the dataset.
+    Produces 10-15 charts based on mandatory rules, deduplicating against
+    any charts that already exist for this job.
+    """
+    _get_job_or_404(job_id, current_user, db)
+    df = _get_df_or_422(job_id)
+
+    # Gather existing charts to avoid duplicates
+    existing = db.query(Chart).filter(Chart.job_id == job_id).all()
+    existing_specs = [
+        {"x_col": c.x_header, "y_col": c.y_header, "chart_type": c.chart_type}
+        for c in existing
+    ]
+
+    # Load htype map if available
+    from app.models.cleaned_dataset import CleanedDataset
+    cd = db.query(CleanedDataset).filter(CleanedDataset.job_id == job_id).first()
+    htypes = cd.htype_map if cd and cd.htype_map else {}
+    derived_columns = cd.derived_metrics_info if cd and cd.derived_metrics_info else []
+
+    # Load goal
+    goal_row = db.query(UserGoal).filter(UserGoal.job_id == job_id).first()
+    goal_text = goal_row.goal_text if goal_row else ""
+
+    suite = generate_full_chart_suite(
+        df=df,
+        htypes=htypes,
+        goal=goal_text,
+        existing_charts=existing_specs,
+        derived_columns=derived_columns,
+    )
+
+    engine = ChartEngine(df)
+    created_charts = []
+
+    for spec in suite:
+        try:
+            x_col = spec["x_col"]
+            y_col = spec.get("y_col")
+            chart_type = spec["chart_type"]
+            group_by = spec.get("group_by")
+            reason = spec.get("reason", "")
+
+            chart_payload = engine.generate_chart_data(x_col, y_col, chart_type, group_by=group_by)
+
+            config = {
+                "xLabel": chart_payload["xLabel"],
+                "yLabel": chart_payload["yLabel"],
+                "xDomain": chart_payload.get("xDomain"),
+                "yDomain": chart_payload.get("yDomain"),
+                "grouped": chart_payload.get("grouped", False),
+                "series_keys": chart_payload.get("series_keys"),
+                "group_by": group_by,
+                "note": chart_payload.get("note"),
+                "layout": chart_payload.get("layout"),
+                "data_key": chart_payload.get("data_key", "y"),
+                "x_data_key": chart_payload.get("x_data_key", "x"),
+                "y_unit": chart_payload.get("y_unit", "plain"),
+            }
+
+            chart = Chart(
+                job_id=job_id,
+                chart_type=chart_type,
+                x_header=x_col,
+                y_header=y_col,
+                title=spec.get("title") or chart_payload["title"],
+                data=chart_payload["data"],
+                config=config,
+                reason=reason,
+                is_recommended=True,
+            )
+            db.add(chart)
+            created_charts.append(chart)
+        except Exception:
+            # Skip charts that fail to generate (bad column combos etc)
+            continue
+
+    db.commit()
+    for c in created_charts:
+        db.refresh(c)
+
+    return created_charts
 
 
 # ── Chart List / Detail / Delete ─────────────────────────────────────────────

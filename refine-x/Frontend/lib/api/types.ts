@@ -143,9 +143,11 @@ export interface HeaderAnalysisResponse {
 export interface SuggestedAnalysis {
   name: string;
   description: string;
+  why: string;
   columns_needed: string[];
   formula_type: string;
   example: string;
+  auto_select: boolean;
 }
 
 export interface RecommendedViz {
@@ -153,6 +155,8 @@ export interface RecommendedViz {
   x_column: string;
   y_column: string;
   reason: string;
+  chart_type_reason: string;
+  group_by: string | null;
 }
 
 export interface FormulaSuggestionsResponse {
@@ -176,6 +180,23 @@ export interface RecommendationItem {
   chart_type: string;
   relevance_score: number;
   reasoning: string;
+  group_by: string | null;
+}
+
+export interface ChartConfig {
+  xLabel?: string;
+  yLabel?: string;
+  xDomain?: [number, number] | null;
+  yDomain?: [number, number] | null;
+  grouped?: boolean;
+  series_keys?: string[] | null;
+  group_by?: string | null;
+  note?: string | null;
+  data_key?: string;
+  x_data_key?: string;
+  y_unit?: 'currency' | 'percent' | 'count' | 'plain';
+  layout?: string | null;
+  [key: string]: unknown;
 }
 
 export interface ChartResponse {
@@ -186,7 +207,8 @@ export interface ChartResponse {
   y_header: string | null;
   title: string;
   data: unknown[];
-  config: Record<string, unknown> | null;
+  config: ChartConfig | null;
+  reason: string | null;
   is_recommended: boolean;
 }
 
@@ -197,6 +219,7 @@ export interface ChartListItem {
   x_header: string;
   y_header: string | null;
   title: string;
+  reason: string | null;
   is_recommended: boolean;
 }
 

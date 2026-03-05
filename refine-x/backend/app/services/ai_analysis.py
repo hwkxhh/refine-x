@@ -12,6 +12,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.config import settings
+from app.services.chart_type_rules import precompute_chart_types
 
 _client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
@@ -303,108 +304,243 @@ def analyze_headers(
 def _build_suggestions_deterministically(columns: list[str], df) -> dict:
     """
     Fallback: generate suggested_analyses and recommended_visualizations
-    from column types without calling GPT.
+    from column types without calling GPT.  Produces 10-12 analyses with
+    dataset-specific 'why' text and smart 'auto_select' (top 5 only).
     """
     import pandas as pd
+
+    lower_cols = {c: c.lower().replace("_", " ").replace("-", " ") for c in columns}
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     cat_cols = [c for c in df.select_dtypes(include=["object", "category"]).columns.tolist()
                 if df[c].nunique() <= 30]
-    date_cols = [c for c in columns if any(k in str(c).lower() for k in ["date", "time", "year", "month", "period"])]
+    date_cols = [c for c in columns if any(k in lower_cols[c] for k in ["date", "time", "year", "month", "period"])]
+
+    # Semantic helpers — find columns by keyword
+    def _find(keywords, pool=None):
+        pool = pool or columns
+        for c in pool:
+            for k in keywords:
+                if k in lower_cols.get(c, c.lower()):
+                    return c
+        return None
+
+    amt_col   = _find(["amount", "revenue", "sales", "total"], numeric_cols)
+    profit_col = _find(["profit", "margin", "income", "earnings"], numeric_cols)
+    qty_col   = _find(["quantity", "qty", "count", "units"], numeric_cols)
+    cat_col   = _find(["category", "type", "class", "segment"])
+    subcat_col = _find(["sub-category", "sub_category", "subcategory", "sub category"])
+    payment_col = _find(["payment", "pay mode", "paymentmode", "pay_mode", "method"])
+    state_col = _find(["state", "region", "province"])
+    city_col  = _find(["city", "district", "area"])
+    name_col  = _find(["customer", "client", "name"])
+    date_col  = date_cols[0] if date_cols else None
 
     analyses = []
     vizzes = []
+    auto_slots = 5  # how many to auto-select
+    rank = 0        # tracks importance ordering
 
-    # Suggested analyses from numeric pairs
-    if len(numeric_cols) >= 2:
+    def _add(name, desc, why, cols, ftype, example, viz=None):
+        nonlocal rank
         analyses.append({
-            "name": "Correlation Analysis",
-            "description": f"Explore relationships between {numeric_cols[0]} and {numeric_cols[1]}",
-            "columns_needed": numeric_cols[:2],
-            "formula_type": "correlation",
-            "example": f"Does {numeric_cols[0]} increase when {numeric_cols[1]} increases?",
+            "name": name, "description": desc, "why": why,
+            "columns_needed": [c for c in cols if c],
+            "formula_type": ftype, "example": example,
+            "auto_select": rank < auto_slots,
         })
-        vizzes.append({
-            "chart_type": "scatter",
-            "x_column": numeric_cols[0],
-            "y_column": numeric_cols[1],
-            "reason": f"Scatter plot to reveal correlation between {numeric_cols[0]} and {numeric_cols[1]}",
-        })
+        if viz:
+            vizzes.append(viz)
+        rank += 1
 
-    if numeric_cols:
-        analyses.append({
-            "name": "Distribution Analysis",
-            "description": f"Understand the distribution of {numeric_cols[0]}",
-            "columns_needed": [numeric_cols[0]],
-            "formula_type": "distribution",
-            "example": f"What is the spread and average of {numeric_cols[0]}?",
-        })
+    # --- 1. Revenue / Amount Trend Over Time ---
+    if date_col and amt_col:
+        _add(
+            "Revenue Trend Over Time",
+            f"Track how {amt_col} changes over {date_col}",
+            f"Your dataset has {amt_col} and {date_col} — a time-series line chart will reveal whether revenue is growing, flat, or declining month over month.",
+            [date_col, amt_col], "time_series",
+            f"Is {amt_col} growing or declining over time?",
+            {"chart_type": "line", "x_column": date_col, "y_column": amt_col,
+             "reason": f"Line chart tracking {amt_col} over {date_col}"},
+        )
 
-    # Category × numeric bar chart
-    if cat_cols and numeric_cols:
-        analyses.append({
-            "name": "Category Breakdown",
-            "description": f"Compare {numeric_cols[0]} across different {cat_cols[0]} groups",
-            "columns_needed": [cat_cols[0], numeric_cols[0]],
-            "formula_type": "aggregation",
-            "example": f"Which {cat_cols[0]} has the highest {numeric_cols[0]}?",
-        })
-        vizzes.append({
-            "chart_type": "bar",
-            "x_column": cat_cols[0],
-            "y_column": numeric_cols[0],
-            "reason": f"Bar chart to compare {numeric_cols[0]} by {cat_cols[0]}",
-        })
-        if len(cat_cols) >= 1 and len(numeric_cols) >= 2:
-            vizzes.append({
-                "chart_type": "bar",
-                "x_column": cat_cols[0],
-                "y_column": numeric_cols[1],
-                "reason": f"Bar chart to compare {numeric_cols[1]} by {cat_cols[0]}",
-            })
+    # --- 2. Profit by Category ---
+    if cat_col and profit_col:
+        _add(
+            "Profit by Category",
+            f"Compare {profit_col} across {cat_col} groups",
+            f"With {cat_col} and {profit_col} columns present, a grouped bar chart will show which product categories are actually profitable vs. which are dragging margins down.",
+            [cat_col, profit_col], "aggregation",
+            f"Which {cat_col} generates the most {profit_col}?",
+            {"chart_type": "bar", "x_column": cat_col, "y_column": profit_col,
+             "reason": f"Bar chart of {profit_col} by {cat_col}"},
+        )
+    elif cat_col and amt_col:
+        _add(
+            "Category Performance",
+            f"Compare {amt_col} across {cat_col} groups",
+            f"Your {cat_col} column lets you see which groups drive the most {amt_col} — essential for prioritisation.",
+            [cat_col, amt_col], "aggregation",
+            f"Which {cat_col} has the highest {amt_col}?",
+            {"chart_type": "bar", "x_column": cat_col, "y_column": amt_col,
+             "reason": f"Bar chart of {amt_col} by {cat_col}"},
+        )
 
-    # Time series if date column present
-    if date_cols and numeric_cols:
-        analyses.append({
-            "name": "Trend Over Time",
-            "description": f"Track how {numeric_cols[0]} changes over {date_cols[0]}",
-            "columns_needed": [date_cols[0], numeric_cols[0]],
-            "formula_type": "time_series",
-            "example": f"Is {numeric_cols[0]} growing or declining over time?",
-        })
-        vizzes.append({
-            "chart_type": "line",
-            "x_column": date_cols[0],
-            "y_column": numeric_cols[0],
-            "reason": f"Line chart to show trend of {numeric_cols[0]} over {date_cols[0]}",
-        })
+    # --- 3. Profit Margin Analysis (derived metric) ---
+    if amt_col and profit_col:
+        _add(
+            "Profit Margin Analysis",
+            f"Calculate {profit_col} ÷ {amt_col} to find true margins",
+            f"Dividing {profit_col} by {amt_col} produces a margin percentage — this reveals which orders or categories have high revenue but razor-thin margins, the most actionable metric in the dataset.",
+            [amt_col, profit_col], "comparison",
+            f"Which rows have the worst margins?",
+            {"chart_type": "scatter", "x_column": amt_col, "y_column": profit_col,
+             "reason": f"Scatter of {amt_col} vs {profit_col} to spot margin outliers"},
+        )
 
-    # Pie chart for category distribution
-    if cat_cols:
-        analyses.append({
-            "name": "Category Distribution",
-            "description": f"Show the proportion of each {cat_cols[0]} group",
-            "columns_needed": [cat_cols[0]],
-            "formula_type": "distribution",
-            "example": f"What percentage does each {cat_cols[0]} represent?",
-        })
-        vizzes.append({
-            "chart_type": "pie",
-            "x_column": cat_cols[0],
-            "y_column": numeric_cols[0] if numeric_cols else cat_cols[0],
-            "reason": f"Pie chart showing distribution across {cat_cols[0]}",
-        })
+    # --- 4. Geographic Analysis ---
+    geo_col = state_col or city_col
+    metric_col = amt_col or (numeric_cols[0] if numeric_cols else None)
+    if geo_col and metric_col:
+        _add(
+            "Geographic Analysis",
+            f"Compare {metric_col} across {geo_col}",
+            f"The {geo_col} column enables regional performance comparison — you can identify under-performing regions or high-potential markets.",
+            [geo_col, metric_col], "aggregation",
+            f"Which {geo_col} has the highest {metric_col}?",
+            {"chart_type": "bar", "x_column": geo_col, "y_column": metric_col,
+             "reason": f"Bar chart of {metric_col} by {geo_col}"},
+        )
 
-    # Fallback if no suggestions generated
+    # --- 5. Customer Analysis ---
+    if name_col and metric_col:
+        _add(
+            "Customer Analysis",
+            f"Rank customers by {metric_col}",
+            f"Your {name_col} column lets you identify the top-spending customers and spot concentration risk — if 20% of customers drive 80% of revenue, that's a risk signal.",
+            [name_col, metric_col], "aggregation",
+            f"Who are the top 10 customers by {metric_col}?",
+        )
+
+    # --- 6. Profit Trend Over Time ---
+    if date_col and profit_col:
+        _add(
+            "Profit Trend Over Time",
+            f"Track how {profit_col} changes over {date_col}",
+            f"Revenue can grow while profit shrinks. Tracking {profit_col} over {date_col} separately reveals margin compression that a combined chart hides.",
+            [date_col, profit_col], "time_series",
+            f"Is {profit_col} growing in line with revenue?",
+            {"chart_type": "line", "x_column": date_col, "y_column": profit_col,
+             "reason": f"Line chart tracking {profit_col} over {date_col}"},
+        )
+
+    # --- 7. Revenue vs Profit Combined ---
+    if date_col and amt_col and profit_col:
+        _add(
+            "Revenue vs Profit Combined",
+            f"Overlay {amt_col} and {profit_col} trends on one chart",
+            f"Putting both {amt_col} and {profit_col} on the same timeline reveals whether profit keeps pace with revenue or if costs are eating into margins.",
+            [date_col, amt_col, profit_col], "time_series",
+            f"Are revenue and profit growing at the same rate?",
+        )
+
+    # --- 8. Sub-Category Deep Dive ---
+    if subcat_col and metric_col:
+        _add(
+            "Sub-Category Deep Dive",
+            f"Granular {metric_col} breakdown by {subcat_col}",
+            f"The {subcat_col} column gives you a more granular view than {cat_col or 'category'} — you can pinpoint exactly which product lines perform best or worst.",
+            [subcat_col, metric_col], "aggregation",
+            f"Which {subcat_col} drives the most {metric_col}?",
+            {"chart_type": "bar", "x_column": subcat_col, "y_column": metric_col,
+             "reason": f"Bar chart of {metric_col} by {subcat_col}"},
+        )
+
+    # --- 9. Payment Mode Analysis ---
+    if payment_col and metric_col:
+        _add(
+            "Payment Mode Analysis",
+            f"Compare {metric_col} across {payment_col}",
+            f"Your {payment_col} column reveals operational insights — do certain payment methods correlate with higher order values or lower margins?",
+            [payment_col, metric_col], "aggregation",
+            f"Which {payment_col} has the highest average {metric_col}?",
+            {"chart_type": "pie", "x_column": payment_col, "y_column": metric_col,
+             "reason": f"Pie chart showing {metric_col} distribution by {payment_col}"},
+        )
+
+    # --- 10. Quantity vs Profit ---
+    if qty_col and profit_col:
+        _add(
+            "Quantity vs Profit",
+            f"Check if higher {qty_col} means higher {profit_col}",
+            f"Having both {qty_col} and {profit_col} lets you test whether volume equals profitability — some high-volume products may actually lose money.",
+            [qty_col, profit_col], "correlation",
+            f"Does selling more units always mean more profit?",
+            {"chart_type": "scatter", "x_column": qty_col, "y_column": profit_col,
+             "reason": f"Scatter plot of {qty_col} vs {profit_col}"},
+        )
+
+    # --- 11. Monthly Order Volume ---
+    if date_col:
+        _add(
+            "Monthly Order Volume",
+            f"Count orders per month using {date_col}",
+            f"Counting rows by {date_col} shows operational throughput — are you processing more or fewer orders over time?",
+            [date_col], "time_series",
+            f"How many orders per month?",
+        )
+
+    # --- 12. Loss-Making Products ---
+    if profit_col and (subcat_col or cat_col):
+        group_col = subcat_col or cat_col
+        _add(
+            "Loss-Making Products",
+            f"Identify {group_col} groups with negative {profit_col}",
+            f"Filtering {group_col} by negative {profit_col} is a critical risk flag — these are products or categories actively losing money.",
+            [group_col, profit_col], "comparison",
+            f"Which {group_col} have total negative {profit_col}?",
+        )
+
+    # --- Catch-all: correlation from any two numeric cols ---
+    if len(numeric_cols) >= 2 and rank < 10:
+        a, b = numeric_cols[0], numeric_cols[1]
+        _add(
+            "Correlation Analysis",
+            f"Explore relationships between {a} and {b}",
+            f"Your dataset has multiple numeric columns ({a}, {b}) — a scatter plot will reveal whether they move together, inversely, or independently.",
+            [a, b], "correlation",
+            f"Does {a} increase when {b} increases?",
+            {"chart_type": "scatter", "x_column": a, "y_column": b,
+             "reason": f"Scatter plot of {a} vs {b}"},
+        )
+
+    # --- Catch-all: category distribution ---
+    if cat_cols and rank < 12:
+        c = cat_cols[0]
+        _add(
+            "Category Distribution",
+            f"Show the proportion of each {c} group",
+            f"A pie chart of {c} shows how balanced or skewed the dataset is across groups.",
+            [c], "distribution",
+            f"What percentage does each {c} represent?",
+            {"chart_type": "pie", "x_column": c,
+             "y_column": numeric_cols[0] if numeric_cols else c,
+             "reason": f"Pie chart of {c} distribution"},
+        )
+
+    # --- Absolute fallback ---
     if not analyses:
         first_col = columns[0] if columns else "column"
-        second_col = columns[1] if len(columns) > 1 else columns[0]
+        second_col = columns[1] if len(columns) > 1 else first_col
         analyses.append({
             "name": "Summary Statistics",
-            "description": f"Compute summary statistics across all columns",
+            "description": "Compute summary statistics across all columns",
+            "why": f"With {len(columns)} columns in the dataset, a statistical summary is the essential first step to understand ranges and outliers.",
             "columns_needed": columns[:2],
             "formula_type": "summary",
             "example": "Mean, median, min, max for all numeric columns",
+            "auto_select": True,
         })
         vizzes.append({
             "chart_type": "bar",
@@ -413,6 +549,10 @@ def _build_suggestions_deterministically(columns: list[str], df) -> dict:
             "reason": f"Bar chart comparing {first_col} and {second_col}",
         })
 
+    # Remove any viz where x and y are the same column
+    vizzes = [v for v in vizzes if v.get("x_column") != v.get("y_column")]
+    # Apply chart-type rulebook to every viz for analyst-grade type selection
+    vizzes = precompute_chart_types(vizzes, df)
     return {"suggested_analyses": analyses, "recommended_visualizations": vizzes}
 
 
@@ -427,14 +567,35 @@ def suggest_analyses_and_viz(
     formula-suggestions endpoint. Tries GPT first, falls back to deterministic.
     """
     sample_text = json.dumps(sample_rows[:5], default=str, indent=2)
-    columns_text = ", ".join(f'"{c}"' for c in columns)
+    columns_text = ", ".join(f'"{ c}"' for c in columns)
 
-    prompt = f"""You are a data analytics advisor. Given a dataset, suggest 4-6 analyses and 3-5 chart recommendations.
+    # Pre-compute rulebook chart type hints for GPT
+    rulebook_hint = ""
+    if df is not None:
+        from app.services.chart_type_rules import determine_chart_type as _rule_fn
+        import pandas as _pd
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        date_cols = [c for c in columns if any(k in str(c).lower() for k in ["date", "time", "year", "month"])]
+        hints = []
+        for dc in date_cols[:1]:
+            for nc in numeric_cols[:3]:
+                r = _rule_fn(dc, nc, df)
+                hints.append(f"  {dc} vs {nc} → {r['chart_type']} ({r['reason'][:80]})")
+        for nc1 in numeric_cols[:2]:
+            for nc2 in numeric_cols[:2]:
+                if nc1 != nc2:
+                    r = _rule_fn(nc1, nc2, df)
+                    hints.append(f"  {nc1} vs {nc2} → {r['chart_type']} ({r['reason'][:80]})")
+        if hints:
+            rulebook_hint = "\n\nPre-computed chart type suggestions (from analyst rulebook):\n" + "\n".join(hints[:8])
+            rulebook_hint += "\nUse these chart types unless you have a specific reason to override."
+
+    prompt = f"""You are a data analytics advisor. Given a dataset, suggest 10-12 analyses and 5-8 chart recommendations.
 
 File: "{filename}"
 Columns: [{columns_text}]
 Sample data (first 5 rows):
-{sample_text}
+{sample_text}{rulebook_hint}
 
 Return ONLY this JSON (no other text):
 {{
@@ -442,37 +603,65 @@ Return ONLY this JSON (no other text):
     {{
       "name": "Short analysis name",
       "description": "One sentence describing the analysis",
+      "why": "Explain specifically WHY this dataset needs this analysis — reference actual column names and what the user will learn. NOT a template.",
       "columns_needed": ["col1", "col2"],
       "formula_type": "correlation|aggregation|distribution|time_series|comparison",
-      "example": "Example question this answers"
+      "example": "Example question this answers",
+      "auto_select": true
     }}
   ],
   "recommended_visualizations": [
     {{
-      "chart_type": "bar|line|scatter|pie",
+      "chart_type": "bar|horizontal_bar|line|scatter|pie|donut|stacked_bar|area",
       "x_column": "exact_column_name",
       "y_column": "exact_column_name",
-      "reason": "Why this chart is useful"
+      "reason": "Why this chart is useful",
+      "group_by": null
     }}
   ]
 }}
 
-Rules:
+CRITICAL RULES:
+- Suggest 10-12 distinct analyses that cover every useful angle of this dataset
+- "why" must be specific to THIS file — mention actual column names, what patterns
+  the user might find, and what business question it answers. Never use template text.
+- Set "auto_select": true for the 5 most important analyses only. The rest are false.
+- The 5 auto-selected should always be the highest-value insights for this data domain.
 - x_column and y_column MUST be exact column names from the list above
-- Suggest charts that reveal the most insight from this specific data
-- For pie charts, x_column = category column, y_column = numeric column
-- For line charts, x_column should be a date/time or sequential column
-- For bar/scatter, pick the most meaningful numeric vs category pairing"""
+- Chart type rules: date+numeric=line, category(<=7)+numeric=bar, category(>7)+numeric=horizontal_bar,
+  two numerics=scatter, few categories proportion=donut, time+category+numeric=stacked_bar
+- Include time-series analyses if any date/time column exists
+- Include derived-metric analyses (e.g., profit margin = profit/amount)
+- Include geographic analyses if location columns exist
+- Include customer/entity analyses if name columns exist
+- For pie/donut charts, x_column = category column, y_column = numeric column
+- For line charts, x_column should be a date/time or sequential column"""
 
     try:
         response = _client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=3000,
         )
         result = _parse_json_from_response(response.choices[0].message.content)
         if result.get("suggested_analyses") or result.get("recommended_visualizations"):
+            # Ensure every analysis has why + auto_select fields
+            auto_count = 0
+            for a in result.get("suggested_analyses", []):
+                a.setdefault("why", a.get("description", ""))
+                a.setdefault("auto_select", False)
+                if a["auto_select"]:
+                    auto_count += 1
+            # If GPT selected too many or none, fix it
+            if auto_count == 0 or auto_count > 5:
+                for i, a in enumerate(result.get("suggested_analyses", [])):
+                    a["auto_select"] = i < 5
+            # Run chart-type rulebook on recommended visualisations
+            if df is not None and result.get("recommended_visualizations"):
+                result["recommended_visualizations"] = precompute_chart_types(
+                    result["recommended_visualizations"], df
+                )
             return result
     except Exception:
         pass
@@ -487,9 +676,11 @@ Rules:
             {
                 "name": "Summary Statistics",
                 "description": "Overview of key statistics across all columns",
+                "why": f"Your file '{filename}' has {len(columns)} columns — a summary will show the range, average, and outliers across all numeric fields.",
                 "columns_needed": columns[:2],
                 "formula_type": "summary",
                 "example": "Mean, median and distribution of numeric columns",
+                "auto_select": True,
             }
         ],
         "recommended_visualizations": [

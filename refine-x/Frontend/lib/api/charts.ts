@@ -36,12 +36,23 @@ export function generateChart(
   xCol: string,
   yCol?: string,
   isRecommended = false,
+  groupBy?: string,
+  reason?: string,
 ): Promise<ChartResponse> {
   return api.post(`/jobs/${jobId}/charts`, {
     x_col: xCol,
     y_col: yCol ?? null,
     is_recommended: isRecommended,
+    group_by: groupBy ?? null,
+    reason: reason ?? null,
   });
+}
+
+/** Auto-generate the full analyst-grade chart suite. */
+export function autoGenerateCharts(
+  jobId: number,
+): Promise<ChartResponse[]> {
+  return api.post(`/jobs/${jobId}/charts/auto`, {});
 }
 
 /** List all charts for a job. */

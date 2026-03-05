@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { ArrowRight, TrendingUp, Users, MapPin, Package, DollarSign, Calendar, Check, Info, Loader2, AlertCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { getFormulaSuggestions } from '@/lib/api/ai-analysis'
-import { setGoal, generateChart } from '@/lib/api/charts'
+import { setGoal, generateChart, autoGenerateCharts } from '@/lib/api/charts'
 import type { SuggestedAnalysis, RecommendedViz } from '@/lib/api/types'
 
 const iconMap: Record<string, any> = {
@@ -58,11 +58,14 @@ export default function AnalyticsSelectionPage() {
     if (!jobId) { setLoading(false); return }
     getFormulaSuggestions(Number(jobId))
       .then((data) => {
-        setAnalyses(data.suggested_analyses ?? [])
+        const items = data.suggested_analyses ?? []
+        setAnalyses(items)
         setVizzes(data.recommended_visualizations ?? [])
-        // pre-select first two
-        const pre = (data.suggested_analyses ?? []).slice(0, 2).map((_, i) => i)
-        setSelectedIds(pre)
+        // Pre-select only the ones the AI marked as auto_select
+        const pre = items
+          .map((a, i) => (a.auto_select ? i : -1))
+          .filter(i => i !== -1)
+        setSelectedIds(pre.length > 0 ? pre : items.slice(0, 5).map((_, i) => i))
       })
       .catch(() => setError('Failed to load formula suggestions'))
       .finally(() => setLoading(false))
@@ -83,10 +86,22 @@ export default function AnalyticsSelectionPage() {
       const goalText = selectedIds.map(i => analyses[i]?.name).filter(Boolean).join(', ')
       await setGoal(id, goalText || 'General analysis', 'custom')
 
-      // Generate charts from recommended visualizations
-      const selectedVizzes = vizzes.slice(0, 3) // generate up to 3 charts
-      for (const v of selectedVizzes) {
-        await generateChart(id, v.x_column, v.y_column || undefined, true).catch(() => {})
+      // Generate the full analyst-grade chart suite in a single call.
+      // This produces 10-15 charts automatically based on dataset columns.
+      await autoGenerateCharts(id).catch(() => {})
+
+      // Also generate any additional charts from recommended visualizations
+      // that might not be covered by the mandatory rules
+      const chartsToGenerate = vizzes.slice(0, Math.max(selectedIds.length, 5))
+      for (const v of chartsToGenerate) {
+        await generateChart(
+          id,
+          v.x_column,
+          v.y_column || undefined,
+          true,
+          v.group_by || undefined,
+          v.chart_type_reason || v.reason || undefined,
+        ).catch(() => {})
       }
 
       router.push(`/dashboard/project/${jobId}/visualize`)
@@ -194,11 +209,12 @@ export default function AnalyticsSelectionPage() {
                 </div>
 
                 {/* Content */}
-                <h3 className="text-lg font-bold text-foreground mb-2">
+                <h3 className="text-lg font-bold text-foreground mb-1">
                   {analytic.name}
                 </h3>
+                <p className="text-xs text-text-muted mb-2">{analytic.description}</p>
                 <p className="text-sm text-text-secondary mb-4 leading-relaxed">
-                  {analytic.description}
+                  {analytic.why || analytic.description}
                 </p>
 
                 {/* Columns needed */}
@@ -240,8 +256,8 @@ export default function AnalyticsSelectionPage() {
       <div className="dashboard-card rounded-2xl p-5 flex items-start gap-4 animate-fade-in-up stagger-8">
         <Info className="w-5 h-5 text-primary flex-shrink-0 mt-0.5" />
         <div className="text-sm text-text-secondary">
-          <span className="font-semibold text-foreground">Tip:</span> We recommend starting with 2-3 analytics to get quick insights. 
-          You can always run additional analytics later from the dashboard.
+          <span className="font-semibold text-foreground">Tip:</span> We've pre-selected the 5 most important analytics for your dataset.
+          You can add more by clicking any card, or remove ones you don't need.
         </div>
       </div>
 

@@ -25,9 +25,11 @@ class DropColumnsRequest(BaseModel):
 class SuggestedAnalysis(BaseModel):
     name: str
     description: str
+    why: str = ""
     columns_needed: list[str]
     formula_type: str
     example: str
+    auto_select: bool = False
 
 
 class RecommendedViz(BaseModel):
@@ -35,6 +37,8 @@ class RecommendedViz(BaseModel):
     x_column: str
     y_column: str
     reason: str
+    chart_type_reason: str = ""
+    group_by: Optional[str] = None
 
 
 class FormulaSuggestionsResponse(BaseModel):
@@ -65,12 +69,15 @@ class RecommendationItem(BaseModel):
     chart_type: str
     relevance_score: float
     reasoning: str
+    group_by: Optional[str] = None
 
 
 class GenerateChartRequest(BaseModel):
     x_col: str
     y_col: Optional[str] = None
     is_recommended: bool = False
+    group_by: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class ChartResponse(BaseModel):
@@ -82,6 +89,7 @@ class ChartResponse(BaseModel):
     title: str
     data: Any
     config: Optional[Any]
+    reason: Optional[str] = None
     is_recommended: bool
 
     model_config = {"from_attributes": True}
@@ -94,6 +102,7 @@ class ChartListItem(BaseModel):
     x_header: str
     y_header: Optional[str]
     title: str
+    reason: Optional[str] = None
     is_recommended: bool
 
     model_config = {"from_attributes": True}

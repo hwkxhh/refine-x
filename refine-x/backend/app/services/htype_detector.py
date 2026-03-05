@@ -716,7 +716,10 @@ class HtypeDetector:
             # Check for Age (0-120 range, integers mostly)
             col_lower = col.lower()
             if min_val >= 0 and max_val <= 150:
-                decimal_ratio = (numeric_values != numeric_values.astype(int)).sum() / len(numeric_values)
+                try:
+                    decimal_ratio = (numeric_values != numeric_values.astype(int)).sum() / len(numeric_values)
+                except (ValueError, OverflowError):
+                    decimal_ratio = 1.0
                 if decimal_ratio < 0.1:  # Mostly integers
                     if "age" in col_lower or "years" in col_lower:
                         return ("HTYPE-007", 0.6, "Numeric distribution suggests age (0-120 integer range)")
@@ -733,13 +736,19 @@ class HtypeDetector:
             
             # Check for Rank (positive integers, sequential-like)
             if min_val >= 1 and max_val <= len(non_null) * 2:
-                decimal_ratio = (numeric_values != numeric_values.astype(int)).sum() / len(numeric_values)
+                try:
+                    decimal_ratio = (numeric_values != numeric_values.astype(int)).sum() / len(numeric_values)
+                except (ValueError, OverflowError):
+                    decimal_ratio = 1.0
                 if decimal_ratio < 0.05:
                     return ("HTYPE-043", 0.4, "Positive integer range suggests rank")
             
             # Default to Quantity for general positive integers
             if min_val >= 0:
-                decimal_ratio = (numeric_values != numeric_values.astype(int)).sum() / len(numeric_values)
+                try:
+                    decimal_ratio = (numeric_values != numeric_values.astype(int)).sum() / len(numeric_values)
+                except (ValueError, OverflowError):
+                    decimal_ratio = 1.0
                 if decimal_ratio < 0.1:
                     return ("HTYPE-016", 0.4, "General positive integer distribution")
             

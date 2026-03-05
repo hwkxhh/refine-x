@@ -82,6 +82,10 @@ class DuplicateSummary:
 # Minimum similarity score to flag as fuzzy duplicate
 FUZZY_THRESHOLD = 0.85
 
+# Hard cap on fuzzy comparisons — prevents O(n²) hangs on large files.
+# Blocking strategy keeps typical comparisons well under this limit.
+MAX_FUZZY_PAIRS = 2_000
+
 # Weights for fuzzy matching components
 FUZZY_WEIGHTS = {
     "name": 0.4,
@@ -757,36 +761,62 @@ class DuplicateResolution:
         """
         groups = []
         exclude = exclude_indices or set()
-        
+
         # Only do fuzzy matching if we have name/contact columns
         if not self.name_columns and not self.contact_columns:
             return groups
-        
-        # Build candidate pairs
+
         candidates = [idx for idx in self.df.index if idx not in exclude]
-        
         if len(candidates) < 2:
             return groups
-        
-        # Compare all pairs (O(n²) - for large datasets would need blocking)
-        fuzzy_pairs = []
-        
-        for i, idx1 in enumerate(candidates):
-            for idx2 in candidates[i+1:]:
-                row1 = self.df.loc[idx1]
-                row2 = self.df.loc[idx2]
-                
-                score = calculate_fuzzy_score(
-                    row1, row2,
-                    self.name_columns,
-                    self.id_columns,
-                    self.contact_columns
+
+        # ── Blocking strategy ─────────────────────────────────────────────
+        # Group candidates by the first 3 lowercase characters of the best
+        # available block column (first name col, then first contact col).
+        # Only rows within the same block are compared — reduces O(n²) to
+        # O(n × avg_block_size²) which is << total pairs in practice.
+        block_col = next(
+            (c for c in self.name_columns + self.contact_columns
+             if c in self.df.columns),
+            None,
+        )
+        if block_col:
+            blocks: dict = defaultdict(list)
+            for idx in candidates:
+                raw = self.df.at[idx, block_col]
+                key = (
+                    str(raw).strip().lower()[:3]
+                    if (raw is not None and not pd.isna(raw))
+                    else "__null__"
                 )
-                
-                if score >= FUZZY_THRESHOLD:
-                    fuzzy_pairs.append((idx1, idx2, score))
-        
-        # Group fuzzy matches
+                blocks[key].append(idx)
+            block_lists = [b for b in blocks.values() if len(b) >= 2]
+        else:
+            block_lists = [candidates]
+
+        # ── Compare within blocks, hard-capped at MAX_FUZZY_PAIRS ─────────
+        fuzzy_pairs = []
+        pairs_checked = 0
+
+        for block in block_lists:
+            if pairs_checked >= MAX_FUZZY_PAIRS:
+                break
+            for i in range(len(block)):
+                if pairs_checked >= MAX_FUZZY_PAIRS:
+                    break
+                for j in range(i + 1, len(block)):
+                    if pairs_checked >= MAX_FUZZY_PAIRS:
+                        break
+                    idx1, idx2 = block[i], block[j]
+                    score = calculate_fuzzy_score(
+                        self.df.loc[idx1], self.df.loc[idx2],
+                        self.name_columns, self.id_columns, self.contact_columns,
+                    )
+                    if score >= FUZZY_THRESHOLD:
+                        fuzzy_pairs.append((idx1, idx2, score))
+                    pairs_checked += 1
+
+        # ── Group fuzzy matches ────────────────────────────────────────────
         group_id = len(self.groups)
         processed = set()
         

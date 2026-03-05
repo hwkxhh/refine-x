@@ -4,7 +4,7 @@ import { useState, useEffect, use } from 'react'
 import Link from 'next/link'
 import {
   LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
-  ScatterChart, Scatter,
+  ScatterChart, Scatter, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts'
 import {
@@ -67,6 +67,62 @@ function InsightBlock({ insights }: { insights: string[] }) {
   )
 }
 
+// -- Helpers -----------------------------------------------------------------
+/** True when all values look like calendar years (1800–2100). */
+function isYearLike(vals: number[]): boolean {
+  return vals.length > 0 && vals.every(v => v >= 1800 && v <= 2100)
+}
+
+/** Compute a sensible XAxis / YAxis domain. Never starts at 0 for year data. */
+function numDomain(
+  vals: number[],
+  yearLike: boolean,
+): [number, number] | ['dataMin', 'dataMax'] {
+  if (!vals.length) return ['dataMin', 'dataMax']
+  const lo = Math.min(...vals)
+  const hi = Math.max(...vals)
+  if (yearLike) return [lo - 1, hi + 1]
+  const span = hi - lo || 1
+  return [lo - span * 0.05, hi + span * 0.05]
+}
+
+// -- Fix A: Universal x-axis tick formatter -----------------------------------
+const formatXAxisTick = (value: string | number): string => {
+  const s = String(value)
+
+  // Remove time components from date strings
+  const cleaned = s
+    .replace(/T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?/g, '')
+    .replace(/\s+\d{2}:\d{2}:\d{2}/g, '')
+    .replace(/\.000000000/g, '')
+    .trim()
+
+  // If it looks like a full date, format it
+  const dt = new Date(cleaned)
+  if (!isNaN(dt.getTime()) && cleaned.includes('-')) {
+    return dt.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+  }
+
+  // Truncate long category names
+  if (cleaned.length > 15) {
+    return cleaned.substring(0, 13) + '...'
+  }
+
+  return cleaned
+}
+
+// -- Fix D: Number formatting on axes -----------------------------------------
+const formatAxisNumber = (value: number, unit?: string): string => {
+  if (typeof value !== 'number' || isNaN(value)) return String(value)
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(0)}K`
+  if (unit === 'percent') return `${value.toFixed(1)}%`
+  return value.toFixed(0)
+}
+
+// -- Fix C: Max pie slices constant -------------------------------------------
+const MAX_PIE_SLICES = 6
+
 // -- Dynamic chart renderer ---------------------------------------------------
 function DynamicChart({ chart }: { chart: ChartResponse }) {
   const data = chart.data as any[]
@@ -74,21 +130,143 @@ function DynamicChart({ chart }: { chart: ChartResponse }) {
     return <p className="text-sm text-text-muted text-center py-8">No data available</p>
   }
 
-  const xLabel = (chart.config as any)?.xLabel ?? chart.x_header
-  const yLabel = (chart.config as any)?.yLabel ?? chart.y_header ?? 'Value'
-  const fmtTick = (v: any) => typeof v === 'number' && v >= 1000 ? `${(v / 1000).toFixed(0)}K` : String(v)
+  const cfg = chart.config ?? {}
+  const xLabel = cfg.xLabel ?? chart.x_header
+  const yLabel = cfg.yLabel ?? chart.y_header ?? 'Value'
+  const seriesKeys: string[] = Array.isArray(cfg.series_keys) ? cfg.series_keys as string[] : []
+  const isGrouped = cfg.grouped === true && seriesKeys.length > 0
 
+  // Fix B: Use the actual column name as dataKey (from backend data_key), with 'y' fallback for legacy data
+  const dataKey = (cfg.data_key as string) || 'y'
+  const xDataKey = (cfg.x_data_key as string) || 'x'
+  const yUnit = (cfg.y_unit as string) || 'plain'
+
+  // Fix D: Y-axis formatter aware of unit type
+  const fmtYTick = (v: any) => formatAxisNumber(Number(v), yUnit)
+
+  // Composite key for a data point — avoids duplicate-key React warnings
+  const rowKey = (row: any, idx: number): string => {
+    const vals = Object.values(row)
+      .map(v => (v == null ? 'null' : String(v)))
+      .join('_')
+    return `${idx}_${vals}`
+  }
+
+  // ── Fix C: Pie/donut with too many slices → fall back to horizontal bar ──
+  if ((chart.chart_type === 'pie' || chart.chart_type === 'donut') && data.length > MAX_PIE_SLICES) {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} layout="vertical" barSize={data.length > 20 ? 10 : 16} margin={{ left: 80 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
+          <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtYTick} />
+          <YAxis dataKey="name" type="category" stroke="#9ca3af" tick={{ fontSize: 10 }} width={75} />
+          <Tooltip content={<CustomTooltip />} />
+          <Bar dataKey="value" name={yLabel} radius={[0, 5, 5, 0]}>
+            {data.map((entry, i) => (
+              <Cell key={rowKey(entry, i)} fill={CHART_COLORS[i % CHART_COLORS.length]} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    )
+  }
+
+  // ── Multi-series line (grouped by entity) ────────────────────────────────
+  if (isGrouped && chart.chart_type === 'line') {
+    const xVals = data.map(d => d.x).filter((v): v is number => typeof v === 'number')
+    const yearX = isYearLike(xVals)
+    const xDomainProp = yearX || cfg.xDomain ? numDomain(xVals, yearX) : undefined
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
+          <XAxis
+            dataKey="x"
+            stroke="#9ca3af"
+            tick={{ fontSize: 11 }}
+            tickFormatter={formatXAxisTick}
+            {...(xDomainProp ? { type: 'number', domain: xDomainProp, scale: 'linear' } : {})}
+          />
+          <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtYTick} />
+          <Tooltip content={<CustomTooltip />} />
+          <Legend iconSize={10} />
+          {seriesKeys.map((key, i) => (
+            <Line
+              key={`series_${key}`}
+              type="monotone"
+              dataKey={key}
+              name={key}
+              stroke={CHART_COLORS[i % CHART_COLORS.length]}
+              strokeWidth={2}
+              dot={false}
+              activeDot={{ r: 4 }}
+            />
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+    )
+  }
+
+  // ── Multi-series bar (grouped by entity) ─────────────────────────────────
+  if (isGrouped && (chart.chart_type === 'bar' || chart.chart_type === 'stacked_bar')) {
+    const isStacked = chart.chart_type === 'stacked_bar'
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} barSize={Math.max(4, Math.floor(40 / seriesKeys.length))}>
+          <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
+          <XAxis dataKey="x" stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={formatXAxisTick} />
+          <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtYTick} />
+          <Tooltip content={<CustomTooltip />} />
+          <Legend iconSize={10} />
+          {seriesKeys.map((key, i) => (
+            <Bar
+              key={`series_${key}`}
+              dataKey={key}
+              name={key}
+              fill={CHART_COLORS[i % CHART_COLORS.length]}
+              radius={[3, 3, 0, 0]}
+              {...(isStacked ? { stackId: 'a' } : {})}
+            />
+          ))}
+        </BarChart>
+      </ResponsiveContainer>
+    )
+  }
+
+  // ── Single-series charts ─────────────────────────────────────────────────
   switch (chart.chart_type) {
-    case 'line':
+    case 'line': {
+      const seen = new Set<unknown>()
+      const dedupedData = data.filter(d => {
+        if (seen.has(d.x)) return false
+        seen.add(d.x)
+        return true
+      })
+      const xVals = dedupedData.map(d => d.x).filter((v): v is number => typeof v === 'number')
+      const yearX = isYearLike(xVals)
+      const xDomainProp = yearX ? numDomain(xVals, true) : undefined
+      const yVals = dedupedData.map(d => d[dataKey]).filter((v): v is number => typeof v === 'number')
+      const yDomainProp = yVals.length ? numDomain(yVals, false) : undefined
       return (
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data}>
+          <LineChart data={dedupedData}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
-            <XAxis dataKey="x" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-            <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtTick} />
+            <XAxis
+              dataKey="x"
+              stroke="#9ca3af"
+              tick={{ fontSize: 11 }}
+              tickFormatter={formatXAxisTick}
+              {...(xDomainProp ? { type: 'number', domain: xDomainProp, scale: 'linear' } : {})}
+            />
+            <YAxis
+              stroke="#9ca3af"
+              tick={{ fontSize: 11 }}
+              tickFormatter={fmtYTick}
+              {...(yDomainProp ? { domain: yDomainProp } : {})}
+            />
             <Tooltip content={<CustomTooltip />} />
             <Line
-              type="monotone" dataKey="y" name={yLabel}
+              type="monotone" dataKey={dataKey} name={yLabel}
               stroke="#6366f1" strokeWidth={2.5}
               dot={{ r: 3, fill: '#6366f1', stroke: 'white', strokeWidth: 2 }}
               activeDot={{ r: 5 }}
@@ -96,18 +274,19 @@ function DynamicChart({ chart }: { chart: ChartResponse }) {
           </LineChart>
         </ResponsiveContainer>
       )
+    }
 
     case 'bar':
       return (
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={data} barSize={data.length > 20 ? 10 : 18}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
-            <XAxis dataKey="x" stroke="#9ca3af" tick={{ fontSize: 11 }} interval={data.length > 15 ? Math.floor(data.length / 10) : 0} />
-            <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtTick} />
+            <XAxis dataKey="x" stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={formatXAxisTick} interval={data.length > 15 ? Math.floor(data.length / 10) : 0} />
+            <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtYTick} />
             <Tooltip content={<CustomTooltip />} />
-            <Bar dataKey="y" name={yLabel} radius={[5, 5, 0, 0]}>
-              {data.map((_, i) => (
-                <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
+            <Bar dataKey={dataKey} name={yLabel} radius={[5, 5, 0, 0]}>
+              {data.map((entry, i) => (
+                <Cell key={rowKey(entry, i)} fill={CHART_COLORS[i % CHART_COLORS.length]} />
               ))}
             </Bar>
           </BarChart>
@@ -115,16 +294,18 @@ function DynamicChart({ chart }: { chart: ChartResponse }) {
       )
 
     case 'pie':
+    case 'donut':
       return (
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie
               data={data} cx="50%" cy="50%"
-              innerRadius={55} outerRadius={85}
-              paddingAngle={3} dataKey="value" nameKey="label"
+              innerRadius={chart.chart_type === 'donut' ? 55 : 0}
+              outerRadius={85}
+              paddingAngle={3} dataKey="value" nameKey="name"
             >
-              {data.map((_, i) => (
-                <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
+              {data.map((entry, i) => (
+                <Cell key={rowKey(entry, i)} fill={CHART_COLORS[i % CHART_COLORS.length]} />
               ))}
             </Pie>
             <Tooltip content={<CustomTooltip />} />
@@ -133,16 +314,117 @@ function DynamicChart({ chart }: { chart: ChartResponse }) {
         </ResponsiveContainer>
       )
 
-    case 'scatter':
+    case 'scatter': {
+      const xKey = xDataKey
+      const yKey = dataKey
+      const xVals = data.map(d => d[xKey]).filter((v): v is number => typeof v === 'number')
+      const yVals = data.map(d => d[yKey]).filter((v): v is number => typeof v === 'number')
+      const yearX = isYearLike(xVals)
+      const yearY = isYearLike(yVals)
+      const xDomainProp = xVals.length ? numDomain(xVals, yearX) : undefined
+      const yDomainProp = yVals.length ? numDomain(yVals, yearY) : undefined
       return (
         <ResponsiveContainer width="100%" height="100%">
           <ScatterChart margin={{ top: 10, right: 20, bottom: 10, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
-            <XAxis dataKey="x" name={xLabel} stroke="#9ca3af" tick={{ fontSize: 11 }} type="number" />
-            <YAxis dataKey="y" name={yLabel} stroke="#9ca3af" tick={{ fontSize: 11 }} type="number" tickFormatter={fmtTick} />
+            <XAxis
+              dataKey={xKey}
+              name={xLabel}
+              stroke="#9ca3af"
+              tick={{ fontSize: 11 }}
+              type="number"
+              domain={xDomainProp}
+              tickFormatter={formatXAxisTick}
+            />
+            <YAxis
+              dataKey={yKey}
+              name={yLabel !== xLabel ? yLabel : `${yLabel} (Y)`}
+              stroke="#9ca3af"
+              tick={{ fontSize: 11 }}
+              type="number"
+              domain={yDomainProp}
+              tickFormatter={fmtYTick}
+            />
             <Tooltip content={<CustomTooltip />} cursor={{ strokeDasharray: '3 3' }} />
             <Scatter name={`${yLabel} vs ${xLabel}`} data={data} fill="#6366f1" />
           </ScatterChart>
+        </ResponsiveContainer>
+      )
+    }
+
+    case 'area': {
+      const seen = new Set<unknown>()
+      const dedupedData = data.filter(d => {
+        if (seen.has(d.x)) return false
+        seen.add(d.x)
+        return true
+      })
+      const xVals = dedupedData.map(d => d.x).filter((v): v is number => typeof v === 'number')
+      const yearX = isYearLike(xVals)
+      const xDomainProp = yearX ? numDomain(xVals, true) : undefined
+      const yVals = dedupedData.map(d => d[dataKey]).filter((v): v is number => typeof v === 'number')
+      const yDomainProp = yVals.length ? numDomain(yVals, false) : undefined
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={dedupedData}>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
+            <XAxis
+              dataKey="x"
+              stroke="#9ca3af"
+              tick={{ fontSize: 11 }}
+              tickFormatter={formatXAxisTick}
+              {...(xDomainProp ? { type: 'number', domain: xDomainProp, scale: 'linear' } : {})}
+            />
+            <YAxis
+              stroke="#9ca3af"
+              tick={{ fontSize: 11 }}
+              tickFormatter={fmtYTick}
+              {...(yDomainProp ? { domain: yDomainProp } : {})}
+            />
+            <Tooltip content={<CustomTooltip />} />
+            <Area
+              type="monotone" dataKey={dataKey} name={yLabel}
+              stroke="#6366f1" strokeWidth={2}
+              fill="#6366f1" fillOpacity={0.15}
+              dot={{ r: 2, fill: '#6366f1', stroke: 'white', strokeWidth: 1 }}
+              activeDot={{ r: 5 }}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      )
+    }
+
+    case 'horizontal_bar':
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={data} layout="vertical" barSize={data.length > 20 ? 10 : 16} margin={{ left: 80 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
+            <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtYTick} />
+            <YAxis dataKey="x" type="category" stroke="#9ca3af" tick={{ fontSize: 10 }} width={75} tickFormatter={(v: string) => v.length > 12 ? v.substring(0, 10) + '...' : v} />
+            <Tooltip content={<CustomTooltip />} />
+            <Bar dataKey={dataKey} name={yLabel} radius={[0, 5, 5, 0]}>
+              {data.map((entry, i) => (
+                <Cell key={rowKey(entry, i)} fill={CHART_COLORS[i % CHART_COLORS.length]} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      )
+
+    case 'stacked_bar':
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={data} barSize={data.length > 20 ? 10 : 18}>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
+            <XAxis dataKey="x" stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={formatXAxisTick} />
+            <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtYTick} />
+            <Tooltip content={<CustomTooltip />} />
+            <Bar dataKey={dataKey} name={yLabel} stackId="a" radius={[5, 5, 0, 0]}>
+              {data.map((entry, i) => (
+                <Cell key={rowKey(entry, i)} fill={CHART_COLORS[i % CHART_COLORS.length]} />
+              ))}
+            </Bar>
+          </BarChart>
         </ResponsiveContainer>
       )
 
@@ -151,10 +433,10 @@ function DynamicChart({ chart }: { chart: ChartResponse }) {
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={data} barSize={18}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,102,241,0.08)" />
-            <XAxis dataKey="x" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-            <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} />
+            <XAxis dataKey="x" stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={formatXAxisTick} />
+            <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={fmtYTick} />
             <Tooltip content={<CustomTooltip />} />
-            <Bar dataKey="y" name={yLabel} fill="#818cf8" radius={[5, 5, 0, 0]} />
+            <Bar dataKey={dataKey} name={yLabel} fill="#818cf8" radius={[5, 5, 0, 0]} />
           </BarChart>
         </ResponsiveContainer>
       )
@@ -165,8 +447,12 @@ function DynamicChart({ chart }: { chart: ChartResponse }) {
 function chartTypeIcon(type: string) {
   switch (type) {
     case 'line': return <TrendingUp className="w-4 h-4 text-primary" />
+    case 'area': return <TrendingUp className="w-4 h-4 text-primary" />
     case 'pie': return <PieIcon className="w-4 h-4 text-primary" />
+    case 'donut': return <PieIcon className="w-4 h-4 text-primary" />
     case 'scatter': return <Activity className="w-4 h-4 text-primary" />
+    case 'horizontal_bar': return <BarChart3 className="w-4 h-4 text-primary" />
+    case 'stacked_bar': return <BarChart3 className="w-4 h-4 text-primary" />
     default: return <BarChart3 className="w-4 h-4 text-primary" />
   }
 }
@@ -236,7 +522,7 @@ export default function VisualizePage({ params }: { params: Promise<{ id: string
   const handleGenerateRecommended = async (rec: RecommendationItem) => {
     setGeneratingChart(true)
     try {
-      const newChart = await generateChart(jobId, rec.x_col, rec.y_col ?? undefined, true)
+      const newChart = await generateChart(jobId, rec.x_col, rec.y_col ?? undefined, true, rec.group_by ?? undefined)
       const full = await getChart(jobId, newChart.id)
       setCharts(prev => [...prev, full])
       setRecommendations(prev => prev.filter(r => r !== rec))
@@ -339,19 +625,24 @@ export default function VisualizePage({ params }: { params: Promise<{ id: string
         </Card>
       ) : (
         <>
-          {/* Top row � up to 3 */}
+          {/* Top row — up to 3 */}
           {topRow.length > 0 && (
             <div className="space-y-4">
               <div className={`grid grid-cols-1 ${topRow.length >= 3 ? 'lg:grid-cols-3' : topRow.length === 2 ? 'lg:grid-cols-2' : ''} gap-6`}>
                 {topRow.map((chart) => (
                   <Card key={chart.id} className="overflow-hidden">
-                    <CardHeader className="pb-2 flex flex-row items-center justify-between">
+                    <CardHeader className="pb-1 flex flex-row items-center justify-between">
                       <CardTitle className="text-base flex items-center gap-2">
                         {chartTypeIcon(chart.chart_type)}
                         {chart.title}
                       </CardTitle>
                       <Badge variant="default">{chart.chart_type}</Badge>
                     </CardHeader>
+                    {chart.reason && (
+                      <div className="px-6 pb-2">
+                        <p className="text-xs italic text-text-muted leading-relaxed">{chart.reason}</p>
+                      </div>
+                    )}
                     <CardContent className="pb-4">
                       <div className="h-[240px]">
                         <DynamicChart chart={chart} />
@@ -372,18 +663,23 @@ export default function VisualizePage({ params }: { params: Promise<{ id: string
             </div>
           )}
 
-          {/* Middle row � next 3 */}
+          {/* Middle row — next 3 */}
           {midRow.length > 0 && (
             <div className={`grid grid-cols-1 ${midRow.length >= 3 ? 'lg:grid-cols-3' : midRow.length === 2 ? 'lg:grid-cols-2' : ''} gap-6`}>
               {midRow.map((chart) => (
                 <Card key={chart.id} className="overflow-hidden">
-                  <CardHeader className="pb-2 flex flex-row items-center justify-between">
+                  <CardHeader className="pb-1 flex flex-row items-center justify-between">
                     <CardTitle className="text-base flex items-center gap-2">
                       {chartTypeIcon(chart.chart_type)}
                       {chart.title}
                     </CardTitle>
                     <Badge variant="default">{chart.chart_type}</Badge>
                   </CardHeader>
+                  {chart.reason && (
+                    <div className="px-6 pb-2">
+                      <p className="text-xs italic text-text-muted leading-relaxed">{chart.reason}</p>
+                    </div>
+                  )}
                   <CardContent className="pb-4">
                     <div className="h-[260px]">
                       <DynamicChart chart={chart} />
@@ -403,18 +699,23 @@ export default function VisualizePage({ params }: { params: Promise<{ id: string
             </div>
           )}
 
-          {/* Bottom rows � 2 cols */}
+          {/* Bottom rows — 2 cols */}
           {bottomRow.length > 0 && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {bottomRow.map((chart) => (
                 <Card key={chart.id} className="overflow-hidden">
-                  <CardHeader className="pb-2 flex flex-row items-center justify-between">
+                  <CardHeader className="pb-1 flex flex-row items-center justify-between">
                     <CardTitle className="text-base flex items-center gap-2">
                       {chartTypeIcon(chart.chart_type)}
                       {chart.title}
                     </CardTitle>
                     <Badge variant="default">{chart.chart_type}</Badge>
                   </CardHeader>
+                  {chart.reason && (
+                    <div className="px-6 pb-2">
+                      <p className="text-xs italic text-text-muted leading-relaxed">{chart.reason}</p>
+                    </div>
+                  )}
                   <CardContent className="pb-4">
                     <div className="h-[260px]">
                       <DynamicChart chart={chart} />

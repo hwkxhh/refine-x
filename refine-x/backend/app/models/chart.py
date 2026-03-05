@@ -15,6 +15,7 @@ class Chart(Base):
     title = Column(String, nullable=False)
     config = Column(JSON, nullable=True)          # colors, labels, etc.
     data = Column(JSON, nullable=False)           # Recharts-compatible data array
+    reason = Column(String, nullable=True)        # analyst reasoning for why this chart was chosen
     is_recommended = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 

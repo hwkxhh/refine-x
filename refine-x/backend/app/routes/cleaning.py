@@ -260,3 +260,63 @@ def export_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline health
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/{job_id}/pipeline-health")
+def pipeline_health(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the per-phase health records stored during pipeline execution.
+
+    Each phase entry has the shape::
+
+        {
+            "phase": "personal_identity",
+            "status": "complete" | "failed",
+            "errors": 0 | 1,
+            "error": "ExcType: message",   # only on failure
+            "traceback": "...",            # last 800 chars, only on failure
+        }
+
+    ``overall_status`` is one of:
+    - ``"complete"``              — all phases succeeded
+    - ``"complete_with_warnings"``— at least one phase had errors > 0 but none failed
+    - ``"failed"``                — at least one phase has status == "failed"
+    - ``"pending"``               — the job hasn't finished yet (no CleanedDataset)
+    """
+    _get_job_or_404(job_id, current_user, db)
+    cleaned = db.query(CleanedDataset).filter(CleanedDataset.job_id == job_id).first()
+    if not cleaned:
+        return {
+            "job_id": job_id,
+            "overall_status": "pending",
+            "total_phases": 0,
+            "failed_phases": 0,
+            "phases": [],
+        }
+
+    summary = cleaned.cleaning_summary or {}
+    phases = summary.get("pipeline_health", [])
+    failed = [p for p in phases if p.get("status") == "failed"]
+    warned = [p for p in phases if p.get("errors", 0) > 0 and p.get("status") != "failed"]
+
+    if failed:
+        overall = "failed"
+    elif warned:
+        overall = "complete_with_warnings"
+    else:
+        overall = "complete"
+
+    return {
+        "job_id": job_id,
+        "overall_status": overall,
+        "total_phases": len(phases),
+        "failed_phases": len(failed),
+        "phases": phases,
+    }

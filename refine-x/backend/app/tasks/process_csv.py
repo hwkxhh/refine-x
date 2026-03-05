@@ -1,5 +1,7 @@
 import io
 import math
+import time
+import traceback
 from datetime import datetime
 
 import numpy as np
@@ -26,6 +28,7 @@ from app.services.duplicate_resolution import DuplicateResolution
 from app.services.conditional_validation import ConditionalValidation
 from app.services.medical_rules import MedicalRules
 from app.services.analytical_formulas import AnalyticalFormulas
+from app.services.derived_metrics import compute_all_derived_metrics
 from app.services.cleaning import DataCleaningPipeline
 from app.services.quality import calculate_quality_score
 from app.services.cache import cache_dataframe
@@ -84,19 +87,40 @@ AI_CONFIDENCE_LOW = 0.60      # Below this → always PendingReview
 
 def _load_dataframe(file_bytes: bytes, file_type: str):
     """
-    Parse raw file bytes into a DataFrame and a list of excel/headerless flags.
-    Returns (df, excel_flags).
+    Parse raw file bytes into a DataFrame.
+    Reads EVERYTHING as str first (dtype=str) to prevent pandas from
+    auto-converting boolean strings to float, crashing on 'True'/'False'.
+    keep_default_na=False prevents 'NA', 'null', 'None' from becoming NaN
+    at read time — let formula functions handle those explicitly.
     """
     _excel_flags = []
 
+    _CSV_ENCODINGS = ["utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"]
+    _CSV_KWARGS = dict(
+        sep=None, engine="python",
+        dtype=str,
+        keep_default_na=False,
+        na_values=[""],          # only true empty cells become NaN
+        on_bad_lines="skip",     # skip malformed rows instead of crashing
+    )
+
     if file_type in ("csv", "txt"):
-        # Error 12: encoding fallback — try UTF-8 first, fall back to latin-1
-        # Error 13: sep=None + engine="python" auto-detects the delimiter
-        try:
-            df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="utf-8")
-        except UnicodeDecodeError:
-            df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="latin-1")
+        df = None
+        for enc in _CSV_ENCODINGS:
+            try:
+                df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, **_CSV_KWARGS)
+                break
+            except UnicodeDecodeError:
+                continue
+        if df is None:
+            raise ValueError("Could not read CSV file with any supported encoding.")
+
     elif file_type in ("xlsx", "xls"):
+        _EXCEL_KWARGS = dict(
+            dtype=str,
+            keep_default_na=False,
+            na_values=[""],
+        )
         # Error 18: pick the sheet with the most rows; flag all sheet names
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
         sheet_names = xl.sheet_names
@@ -110,7 +134,7 @@ def _load_dataframe(file_bytes: bytes, file_type: str):
                     best_sheet = sname
             except Exception:
                 continue
-        df = xl.parse(best_sheet)
+        df = xl.parse(best_sheet, **_EXCEL_KWARGS)
         if len(sheet_names) > 1:
             _excel_flags.append({
                 "flag_type": "EXCEL_MULTI_SHEET",
@@ -124,10 +148,15 @@ def _load_dataframe(file_bytes: bytes, file_type: str):
                 "pending_review": True,
             })
     else:
-        try:
-            df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="utf-8")
-        except UnicodeDecodeError:
-            df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", encoding="latin-1")
+        df = None
+        for enc in _CSV_ENCODINGS:
+            try:
+                df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, **_CSV_KWARGS)
+                break
+            except UnicodeDecodeError:
+                continue
+        if df is None:
+            raise ValueError("Could not read file with any supported encoding.")
 
     return df, _excel_flags
 
@@ -145,16 +174,24 @@ def _detect_headerless(file_bytes: bytes, file_type: str, df, _excel_flags: list
             if c.strip().lstrip("-").replace(".", "").isdigit()
         )
         if numeric_header_count / len(col_names) >= 0.7:
-            try:
-                df = pd.read_csv(
-                    io.BytesIO(file_bytes), sep=None, engine="python",
-                    encoding="utf-8", header=None,
-                )
-            except UnicodeDecodeError:
-                df = pd.read_csv(
-                    io.BytesIO(file_bytes), sep=None, engine="python",
-                    encoding="latin-1", header=None,
-                )
+            _CSV_ENCODINGS = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+            _CSV_KWARGS = dict(
+                sep=None, engine="python",
+                header=None,
+                dtype=str,
+                keep_default_na=False,
+                na_values=[""],
+                on_bad_lines="skip",
+            )
+            df_new = None
+            for enc in _CSV_ENCODINGS:
+                try:
+                    df_new = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, **_CSV_KWARGS)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if df_new is not None:
+                df = df_new
             df.columns = [f"col_{i}" for i in range(len(df.columns))]
             _excel_flags.append({
                 "flag_type": "HEADERLESS_FILE_DETECTED",
@@ -167,6 +204,83 @@ def _detect_headerless(file_bytes: bytes, file_type: str, df, _excel_flags: list
     return df, _excel_flags
 
 
+def _sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fix 6 — Mandatory sanitisation step. Runs immediately after file read,
+    before GLOBAL rules, before everything else.
+
+    1. Converts numpy scalar cells to native Python types.
+    2. For object-dtype columns (all strings after dtype=str read):
+       - If >50 % of values look like booleans → leave as string (HTYPE-018).
+       - If ≥90 % convert successfully to float → convert the column.
+       - Otherwise leave as string.
+    3. For bool dtype columns → convert to native Python bool.
+
+    Never crashes. Never drops data.
+    """
+    from app.utils.value_safety import to_native, is_null, _BOOL_LIKE
+
+    for col in df.columns:
+        # Step 1 — Convert numpy scalars to Python natives cell-by-cell
+        try:
+            df[col] = df[col].map(lambda x: to_native(x) if x is not None else None)
+        except Exception:
+            pass  # keep column as-is if map fails
+
+        # Step 2 — Handle object dtype (strings after dtype=str read)
+        if df[col].dtype == object:
+            try:
+                non_null = df[col].dropna()
+                if len(non_null) == 0:
+                    continue
+                str_vals = non_null.astype(str).str.strip().str.lower()
+                bool_ratio = str_vals.isin(_BOOL_LIKE).mean()
+                if bool_ratio > 0.5:
+                    continue  # boolean-string column — do NOT convert to numeric
+
+                converted = pd.to_numeric(df[col], errors="coerce")
+                nn_count = df[col].notna().sum()
+                if nn_count > 0 and converted.notna().sum() / nn_count >= 0.90:
+                    df[col] = converted
+            except Exception:
+                pass
+
+        # Step 3 — Normalise numpy bool dtype columns
+        elif df[col].dtype in (bool, np.bool_):
+            try:
+                df[col] = df[col].map(lambda x: bool(x) if x is not None else None)
+            except Exception:
+                pass
+
+    return df
+
+
+def _run_phase(phase_name: str, fn, default_result=None, default_df=None, default_flags=None):
+    """
+    Fix 5 — Phase-level error isolation.
+    Execute one pipeline phase function. If it raises, log the error and
+    return safe defaults so the pipeline continues uninterrupted.
+
+    Returns (result, phase_record) where phase_record can be stored in
+    cleaning_summary["pipeline_health"].
+    """
+    try:
+        result = fn()
+        record = {"phase": phase_name, "status": "complete", "errors": 0}
+        return result, record
+    except Exception as exc:
+        tb_str = traceback.format_exc()
+        record = {
+            "phase": phase_name,
+            "status": "failed",
+            "errors": 1,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": tb_str[-1000:],   # last 1000 chars to avoid bloat
+        }
+        print(f"[pipeline] Phase '{phase_name}' FAILED: {exc}\n{tb_str}")
+        return default_result, record
+
+
 def _run_steps_1_through_4(job_id, job, db, file_bytes):
     """
     Shared helper: run Steps 1-4 (Load → Global → Struct) and return
@@ -176,9 +290,12 @@ def _run_steps_1_through_4(job_id, job, db, file_bytes):
     df, _excel_flags = _detect_headerless(file_bytes, job.file_type, df, _excel_flags)
 
     # ── Normalise column names to plain Python str ────────────────
-    # Prevents 'numpy.int64 has no attribute lower' across all downstream
-    # rule engines (GlobalRules, StructRules, HtypeDetector, etc.)
     df.columns = [str(c) for c in df.columns]
+
+    # ── Fix 6: Sanitise DataFrame before ANY rules run ────────────
+    # Converts numpy scalars to Python natives; safely converts numeric-
+    # looking string columns back to float; guards bool-string columns.
+    df = _sanitize_dataframe(df)
 
     original_row_count = len(df)
 
@@ -277,12 +394,14 @@ def process_csv_file(self, job_id: int):
         }
 
     except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[PHASE1 CRASH] job_id={job_id}\n{tb}")
         db.rollback()
         if job:
             job.status = "failed"
-            job.error_message = str(e)
+            job.error_message = f"{type(e).__name__}: {str(e)}"
             db.commit()
-        return {"error": str(e), "job_id": job_id}
+        return {"error": str(e), "job_id": job_id, "traceback": tb[-2000:]}
 
     finally:
         db.close()
@@ -434,117 +553,164 @@ def resume_pipeline_after_review(self, job_id: int):
                 })
                 # Keep HtypeDetector result (already in htype_map)
 
+        # ── Per-phase health tracking ─────────────────────────────────
+        # Each phase appends {"phase", "status", "errors", ...} here.
+        # Stored in cleaning_summary["pipeline_health"] at the end.
+        phase_health: list = []
+
         # ── Personal Identity Rules (Session 4) ──────────────────────
-        # Applies HTYPE-specific cleaning for FNAME, SNAME, UID, AGE, GEN
-        # columns based on the HTYPE classification from Session 3.
-        pi_runner = PersonalIdentityRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        pi_summary = pi_runner.run_all()
-        df = pi_runner.df
-        pi_flags = pi_runner.flags
+        pi_summary, pi_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = PersonalIdentityRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            pi_summary = _r.run_all(); df = _r.df; pi_flags = _r.flags
+            phase_health.append({"phase": "personal_identity", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "personal_identity", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] personal_identity FAILED: {_exc}\n{_tb}")
 
         # ── Date & Time Rules (Session 5) ─────────────────────────────
-        # Applies HTYPE-specific cleaning for DATE, TIME, DTM, DUR, FISC
-        # columns based on the HTYPE classification from Session 3.
-        dt_runner = DateTimeRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        dt_summary = dt_runner.run_all()
-        df = dt_runner.df
-        dt_flags = dt_runner.flags
+        dt_summary, dt_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = DateTimeRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            dt_summary = _r.run_all(); df = _r.df; dt_flags = _r.flags
+            phase_health.append({"phase": "date_time", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "date_time", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] date_time FAILED: {_exc}\n{_tb}")
 
         # ── Contact & Location Rules (Session 6) ─────────────────────
-        # Applies HTYPE-specific cleaning for PHONE, EMAIL, ADDR, CITY,
-        # CNTRY, POST, GEO columns based on HTYPE classification.
-        cl_runner = ContactLocationRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        cl_summary = cl_runner.run_all()
-        df = cl_runner.df
-        cl_flags = cl_runner.flags
+        cl_summary, cl_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = ContactLocationRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            cl_summary = _r.run_all(); df = _r.df; cl_flags = _r.flags
+            phase_health.append({"phase": "contact_location", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "contact_location", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] contact_location FAILED: {_exc}\n{_tb}")
 
         # ── Numeric & Financial Rules (Session 7) ────────────────────
-        # Applies HTYPE-specific cleaning for AMT, QTY, PCT, SCORE,
-        # CUR, RANK, CALC columns based on HTYPE classification.
-        nf_runner = NumericFinancialRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        nf_summary = nf_runner.run_all()
-        df = nf_runner.df
-        nf_flags = nf_runner.flags
+        nf_summary, nf_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = NumericFinancialRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            nf_summary = _r.run_all(); df = _r.df; nf_flags = _r.flags
+            phase_health.append({"phase": "numeric_financial", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "numeric_financial", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] numeric_financial FAILED: {_exc}\n{_tb}")
 
         # ── Boolean, Category & Status Rules (Session 8) ─────────────
-        # Applies HTYPE-specific cleaning for BOOL, CAT, STAT, SURV,
-        # MULTI columns based on HTYPE classification.
-        bc_runner = BooleanCategoryRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        bc_summary = bc_runner.run_all()
-        df = bc_runner.df
-        bc_flags = bc_runner.flags
+        bc_summary, bc_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = BooleanCategoryRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            bc_summary = _r.run_all(); df = _r.df; bc_flags = _r.flags
+            phase_health.append({"phase": "boolean_category", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "boolean_category", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] boolean_category FAILED: {_exc}\n{_tb}")
 
         # ── Organizational & Product Rules (Session 9) ───────────────
-        # Applies HTYPE-specific cleaning for PROD, SKU, ORG, JOB,
-        # DEPT, REFNO, VER columns based on HTYPE classification.
-        op_runner = OrgProductRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        op_summary = op_runner.run_all()
-        df = op_runner.df
-        op_flags = op_runner.flags
+        op_summary, op_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = OrgProductRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            op_summary = _r.run_all(); df = _r.df; op_flags = _r.flags
+            phase_health.append({"phase": "org_product", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "org_product", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] org_product FAILED: {_exc}\n{_tb}")
 
         # ── Text & Technical Rules (Session 10) ──────────────────────
-        # Applies HTYPE-specific cleaning for TEXT, URL, IP, FILE
-        # columns based on HTYPE classification.
-        tt_runner = TextTechnicalRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        tt_summary = tt_runner.run_all()
-        df = tt_runner.df
-        tt_flags = tt_runner.flags
+        tt_summary, tt_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = TextTechnicalRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            tt_summary = _r.run_all(); df = _r.df; tt_flags = _r.flags
+            phase_health.append({"phase": "text_technical", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "text_technical", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] text_technical FAILED: {_exc}\n{_tb}")
 
         # ── Missing Value Decision Matrix (Session 12) ───────────────
-        # Analyzes missing values and auto-fills derivable values,
-        # suggests medium-confidence fills, prompts for unknowns.
-        mv_runner = MissingValueMatrix(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        mv_summary = mv_runner.run_all()
-        df = mv_runner.df
-        mv_flags = mv_runner.flags
+        mv_summary, mv_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = MissingValueMatrix(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            mv_summary = _r.run_all(); df = _r.df; mv_flags = _r.flags
+            phase_health.append({"phase": "missing_value_matrix", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "missing_value_matrix", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] missing_value_matrix FAILED: {_exc}\n{_tb}")
 
         # ── Duplicate Resolution (Session 13) ────────────────────────
-        # Detects exact, partial, fuzzy, and temporal duplicates.
-        # Auto-removes exact duplicates, flags others for user review.
-        dup_runner = DuplicateResolution(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        dup_summary = dup_runner.run_all()
-        df = dup_runner.df
-        dup_flags = dup_runner.flags
+        dup_summary, dup_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = DuplicateResolution(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            dup_summary = _r.run_all(); df = _r.df; dup_flags = _r.flags
+            phase_health.append({"phase": "duplicate_resolution", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "duplicate_resolution", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] duplicate_resolution FAILED: {_exc}\n{_tb}")
 
         # ── Conditional Validation (Session 15) ──────────────────────
-        # Cross-column validation for logical consistency: status-date
-        # dependencies, date sequences, age-DOB, score-pass, referential
-        # integrity, and total=sum validations. Flags issues for review.
-        cond_runner = ConditionalValidation(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        cond_summary = cond_runner.run_all()
-        cond_flags = cond_runner.flags
+        cond_summary, cond_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = ConditionalValidation(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            cond_summary = _r.run_all(); cond_flags = _r.flags
+            phase_health.append({"phase": "conditional_validation", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "conditional_validation", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] conditional_validation FAILED: {_exc}\n{_tb}")
 
         # ── Medical Rules (Session 16) ───────────────────────────────
-        # HTYPE-031 (Medical Diagnosis): HIGH-SENSITIVITY PII - title case,
-        # ICD validation, abbreviation expansion (HTN, DM, MI, etc.)
-        # HTYPE-032 (Physical Measurement): unit extraction, imperial-metric
-        # conversion, BMI derivation and categorization, range validation.
-        med_runner = MedicalRules(
-            job_id=job_id, df=df, db=db, htype_map=htype_map,
-        )
-        med_summary = med_runner.run_all()
-        df = med_runner.df
-        med_flags = med_runner.flags
+        med_summary, med_flags = {}, []
+        _t0 = time.perf_counter()
+        try:
+            _r = MedicalRules(job_id=job_id, df=df, db=db, htype_map=htype_map)
+            med_summary = _r.run_all(); df = _r.df; med_flags = _r.flags
+            phase_health.append({"phase": "medical_rules", "status": "complete", "errors": 0, "elapsed_s": round(time.perf_counter() - _t0, 3)})
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            phase_health.append({"phase": "medical_rules", "status": "failed", "errors": 1,
+                                  "error": f"{type(_exc).__name__}: {_exc}", "traceback": _tb[-800:],
+                                  "elapsed_s": round(time.perf_counter() - _t0, 3)})
+            print(f"[pipeline] medical_rules FAILED: {_exc}\n{_tb}")
 
         # Merge medical PII tags with existing PII tags
         pii_tags.update(med_summary.get("pii_tags", {}))
@@ -566,6 +732,8 @@ def resume_pipeline_after_review(self, job_id: int):
         # Merge row_count_original into summary for completeness
         summary["row_count_original"] = original_row_count
         summary["row_count_cleaned"] = len(cleaned_df)
+        # Phase-level health records (Fix 5 — defensive pipeline)
+        summary["pipeline_health"] = phase_health
 
         # ── Quality score ─────────────────────────────────────────────
         quality = calculate_quality_score(cleaned_df, original_row_count)
@@ -577,6 +745,33 @@ def resume_pipeline_after_review(self, job_id: int):
             job_id=job_id, df=cleaned_df, db=db, htype_map=htype_map,
         )
         analytics_results = analytics_runner.run_all()
+
+        # ── Derived Metrics (computed columns) ────────────────────
+        # Pattern-match column names and compute all applicable
+        # derived metrics (profit margin %, revenue per unit, etc.).
+        # These new columns flow to Redis cache → chart generation.
+        _t0_dm = time.perf_counter()
+        try:
+            cleaned_df, derived_info = compute_all_derived_metrics(
+                cleaned_df, htype_map=htype_map,
+            )
+            phase_health.append({
+                "phase": "derived_metrics",
+                "status": "ok",
+                "columns_added": len(derived_info),
+                "elapsed_s": round(time.perf_counter() - _t0_dm, 3),
+            })
+        except Exception as _exc:
+            _tb = traceback.format_exc()
+            derived_info = []
+            phase_health.append({
+                "phase": "derived_metrics",
+                "status": "error",
+                "error": f"{type(_exc).__name__}: {_exc}",
+                "traceback": _tb[-800:],
+                "elapsed_s": round(time.perf_counter() - _t0_dm, 3),
+            })
+            print(f"[pipeline] derived_metrics FAILED: {_exc}\n{_tb}")
 
         # ── Build per-column metadata ─────────────────────────────────
         col_meta = {}
@@ -624,6 +819,7 @@ def resume_pipeline_after_review(self, job_id: int):
             analytical_results=_to_python(analytics_results),
             conditional_flags=_to_python(cond_flags),
             medical_flags=_to_python(med_flags),
+            derived_metrics_info=_to_python(derived_info),
             created_at=datetime.utcnow(),
         )
         db.add(cleaned_record)
@@ -666,12 +862,14 @@ def resume_pipeline_after_review(self, job_id: int):
         }
 
     except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[PIPELINE CRASH] job_id={job_id}\n{tb}")
         db.rollback()
         if job:
             job.status = "failed"
-            job.error_message = str(e)
+            job.error_message = f"{type(e).__name__}: {str(e)}"
             db.commit()
-        return {"error": str(e), "job_id": job_id}
+        return {"error": str(e), "job_id": job_id, "traceback": tb[-2000:]}
 
     finally:
         db.close()

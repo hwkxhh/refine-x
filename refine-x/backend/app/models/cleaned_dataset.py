@@ -96,6 +96,10 @@ class CleanedDataset(Base):
     # HTYPE-032 (Physical Measurement) includes BMI derivation and validation
     medical_flags = Column(JSON, nullable=True)
 
+    # Derived Metrics — computed columns added post-cleaning
+    # [{name, label, htype, is_derived, source_columns, valid_values, domain_hint}]
+    derived_metrics_info = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
