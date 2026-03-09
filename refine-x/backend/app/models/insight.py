@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Text
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Text, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
@@ -14,6 +14,8 @@ class Insight(Base):
     confidence = Column(String, nullable=False)        # low|medium|high
     confidence_score = Column(Float, nullable=False)   # 0.0-1.0
     recommendations = Column(JSON, nullable=True)       # [{action, reasoning}]
+    is_ai_generated = Column(Boolean, nullable=True)   # True = GPT; False = statistical fallback
+    model_name = Column(String, nullable=True)         # "gpt-4o" | "statistical_fallback"
     created_at = Column(DateTime, default=datetime.utcnow)
 
     chart = relationship("Chart", back_populates="insights")

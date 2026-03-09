@@ -13,8 +13,11 @@ from openai import OpenAI
 
 from app.config import settings
 from app.services.chart_type_rules import determine_chart_type as _rulebook_determine
+from app.services.column_role_classifier import get_plottable_columns, NEVER_USE_AS_AXIS
 
 _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+import logging
+logger = logging.getLogger(__name__)
 
 # Fixed allowed chart types - ChartEngine must support all of these
 ALLOWED_CHART_TYPES = [
@@ -184,7 +187,19 @@ def recommend_headers(
     time_col = structure.get("time_col")
     entity_col = structure.get("entity_col")
 
-    columns_text = ", ".join(f'"{c}"' for c in column_names)
+    # ── Role-gate: compute blocked columns before anything else ──────────────
+    _blocked_set: set[str] = set()
+    _safe_df: pd.DataFrame = df if df is not None else pd.DataFrame(data_sample)
+    try:
+        _role_info = get_plottable_columns(_safe_df)
+        _blocked_set = {b["column"] for b in _role_info["blocked"]}
+    except Exception:
+        pass   # classifier failure is non-fatal; proceed with no filter
+
+    # Only show plottable columns to GPT — never expose identifiers/sequences
+    safe_columns = [c for c in column_names if c not in _blocked_set]
+
+    columns_text = ", ".join(f'"{c}"' for c in safe_columns)
     sample_text = json.dumps(data_sample[:5], default=str, indent=2)
     chart_types_text = ", ".join(ALLOWED_CHART_TYPES)
 
@@ -231,18 +246,32 @@ Return ONLY valid JSON (no markdown fences):
 ]"""
 
     try:
+        logger.info(
+            f"[GPT CALL START] recommend_headers — "
+            f"columns={len(column_names)}  dataset_type={dataset_type!r}  goal={user_goal!r}"
+        )
         response = _client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=1800,
         )
+        logger.info(
+            f"[GPT CALL SUCCESS] recommend_headers — "
+            f"tokens used: {response.usage.total_tokens}"
+        )
         result = _parse_json(response.choices[0].message.content)
         if isinstance(result, dict):
             result = list(result.values())[0] if result else []
-    except Exception:
+    except Exception as e:
+        logger.error(
+            f"[GPT CALL FAILED] recommend_headers — {type(e).__name__}: {e}. "
+            f"Falling back to deterministic recommendations."
+        )
         if df is not None:
-            return _deterministic_recommendations(column_names, df, structure)
+            safe_df_fb = df[[c for c in df.columns if c not in _blocked_set]]
+            safe_cols_fb = [c for c in column_names if c not in _blocked_set]
+            return _deterministic_recommendations(safe_cols_fb, safe_df_fb, structure)
         return []
 
     # ── Validate and normalise ────────────────────────────────────────────
@@ -258,8 +287,14 @@ Return ONLY valid JSON (no markdown fences):
 
         if not x_col or x_col not in column_names:
             continue
+        # Role-gate: never allow a blocked column as any axis
+        if x_col in _blocked_set:
+            continue
         if y_col and y_col not in column_names:
             y_col = None
+        if y_col and y_col in _blocked_set:
+            y_col = None
+            chart_type = "pie"
         if group_by and group_by not in column_names:
             group_by = None
 

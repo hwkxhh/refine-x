@@ -5,7 +5,17 @@ from pydantic import BaseModel
 
 # ── Phase 3 AI header analysis ───────────────────────────────────────────────
 
+class AnalyzedColumn(BaseModel):
+    column: str
+    decision: str              # "keep" | "drop"
+    what_it_measures: str      # plain English: what does this column actually contain
+    why: str                   # specific reason for the keep/drop decision
+    analytical_use: Optional[str] = None   # how to use it (keep only)
+    warning: Optional[str] = None          # data quality concern, if any
+
+
 class UnnecessaryColumn(BaseModel):
+    """Kept for backward compatibility. Derived from AnalyzedColumn(decision=="drop")."""
     column: str
     reason: str
     impact_if_removed: str
@@ -13,8 +23,9 @@ class UnnecessaryColumn(BaseModel):
 
 class HeaderAnalysisResponse(BaseModel):
     job_id: int
-    unnecessary_columns: list[UnnecessaryColumn]
-    essential_columns: list[str]
+    columns: list[AnalyzedColumn]          # full per-column AI analysis (primary field)
+    essential_columns: list[str]           # derived: columns where decision == "keep"
+    unnecessary_columns: list[UnnecessaryColumn]  # derived: columns where decision == "drop"
     dataset_summary: str
 
 
@@ -118,6 +129,8 @@ class InsightResponse(BaseModel):
     confidence: str
     confidence_score: float
     recommendations: Optional[Any]
+    is_ai_generated: Optional[bool] = None
+    model_name: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

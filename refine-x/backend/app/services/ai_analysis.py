@@ -15,6 +15,8 @@ from app.config import settings
 from app.services.chart_type_rules import precompute_chart_types
 
 _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+import logging
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -230,12 +232,28 @@ Return ONLY this exact JSON structure (no other text):
 Confidence: 0.9+ = certain, 0.7-0.9 = likely, 0.5-0.7 = uncertain, <0.5 = guess
 Formulas: Use the COMPLETE formula list for the assigned HTYPE from the reference above."""
 
-    response = _client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=3000,
+    logger.info(
+        f"[GPT CALL START] classify_and_assign — file={filename!r}  "
+        f"columns={len(columns)}  {columns}"
     )
+
+    try:
+        response = _client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=3000,
+        )
+        logger.info(
+            f"[GPT CALL SUCCESS] classify_and_assign — file={filename!r}  "
+            f"tokens used: {response.usage.total_tokens}"
+        )
+    except Exception as e:
+        logger.error(
+            f"[GPT CALL FAILED] classify_and_assign — file={filename!r}  "
+            f"{type(e).__name__}: {e}"
+        )
+        raise
 
     result = _parse_json_from_response(response.choices[0].message.content)
     

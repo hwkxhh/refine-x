@@ -5,6 +5,7 @@ with Python-computed statistics passed to GPT for explanation only.
 """
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -15,6 +16,7 @@ from openai import OpenAI
 from app.config import settings
 
 _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+logger = logging.getLogger(__name__)
 
 
 def _parse_json(text: str):
@@ -30,186 +32,244 @@ def _confidence_category(score: float) -> str:
     return "low"
 
 
-def _precompute_statistics(chart_data: list[dict], x_header: str) -> dict:
+def safe_precompute_statistics(
+    chart_data: list[dict], x_col: str, y_col: str | None = None
+) -> dict:
     """
-    Stage 5 Pre-computation: Compute all statistics in Python BEFORE calling GPT.
-    
-    Computes:
-    - peaks: Maximum values and their x-axis positions
-    - lows: Minimum values and their x-axis positions  
-    - trends: Direction (increasing/decreasing/stable), slope, R² if applicable
-    - outliers: Values beyond 1.5 IQR
-    - anomalies: Sudden jumps or drops (>2 std deviations from rolling mean)
-    - period_comparisons: First half vs second half comparison
-    - averages: Mean, median, mode
+    Compute statistics for any chart data safely.
+    Handles any key naming convention (x/y, name/value, label/count, etc.).
+    Never returns empty — always returns something meaningful.
     """
-    df = pd.DataFrame(chart_data)
-    
-    if "y" not in df.columns or len(df) == 0:
-        return {"error": "No y-axis data available"}
-    
-    # Convert to numeric
-    y_values = pd.to_numeric(df["y"], errors="coerce")
-    x_values = df.get("x", pd.Series(range(len(df))))
-    
-    # Filter out NaN
-    valid_mask = ~y_values.isna()
-    y_clean = y_values[valid_mask].reset_index(drop=True)
-    x_clean = x_values[valid_mask].reset_index(drop=True)
-    
-    if len(y_clean) == 0:
-        return {"error": "No valid numeric y-axis data"}
-    
-    stats = {}
-    
-    # ===== PEAKS =====
-    max_val = float(y_clean.max())
-    max_idx = int(y_clean.idxmax())
-    stats["peaks"] = {
-        "maximum_value": round(max_val, 4),
-        "maximum_at": str(x_clean.iloc[max_idx]) if max_idx < len(x_clean) else "N/A",
-        "maximum_index": max_idx,
+    effective_y = y_col or "value"
+    stats: dict = {
+        "x_column": x_col,
+        "y_column": effective_y,
+        "data_points": len(chart_data),
+        "peaks": None,
+        "lows": None,
+        "averages": None,
+        "trends": None,
+        "outliers": None,
+        "top_values": [],
+        "bottom_values": [],
     }
-    
-    # ===== LOWS =====
-    min_val = float(y_clean.min())
-    min_idx = int(y_clean.idxmin())
-    stats["lows"] = {
-        "minimum_value": round(min_val, 4),
-        "minimum_at": str(x_clean.iloc[min_idx]) if min_idx < len(x_clean) else "N/A",
-        "minimum_index": min_idx,
-    }
-    
-    # ===== AVERAGES =====
-    stats["averages"] = {
-        "mean": round(float(y_clean.mean()), 4),
-        "median": round(float(y_clean.median()), 4),
-        "std_dev": round(float(y_clean.std()), 4) if len(y_clean) > 1 else 0,
-        "total": round(float(y_clean.sum()), 4),
-        "count": len(y_clean),
-    }
-    
-    # ===== TRENDS =====
-    if len(y_clean) >= 3:
-        try:
-            # Linear regression for trend
-            x_numeric = np.arange(len(y_clean))
-            slope, intercept = np.polyfit(x_numeric, y_clean.values, 1)
-            
-            # Calculate R² 
-            y_pred = slope * x_numeric + intercept
-            ss_res = np.sum((y_clean.values - y_pred) ** 2)
-            ss_tot = np.sum((y_clean.values - y_clean.mean()) ** 2)
-            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-            
-            # Determine direction
-            if abs(slope) < 0.01 * stats["averages"]["mean"]:
-                direction = "stable"
-            elif slope > 0:
-                direction = "increasing"
-            else:
-                direction = "decreasing"
-            
-            # Calculate percentage change from first to last
-            first_val = y_clean.iloc[0]
-            last_val = y_clean.iloc[-1]
-            pct_change = ((last_val - first_val) / first_val * 100) if first_val != 0 else 0
-            
-            stats["trends"] = {
-                "direction": direction,
-                "slope": round(float(slope), 6),
-                "r_squared": round(float(r_squared), 4),
-                "overall_change_percent": round(float(pct_change), 2),
-                "confidence": "high" if r_squared > 0.7 else ("medium" if r_squared > 0.4 else "low"),
+
+    if not chart_data:
+        stats["note"] = "No data available"
+        return stats
+
+    # ── Flexible value extraction ─────────────────────────────────────────
+    # Try the explicit column name first, then common fallbacks
+    y_candidates = [c for c in [y_col, "y", "value", "count", "amount", "total"] if c]
+    x_candidates = [c for c in [x_col, "x", "name", "label", "category"] if c]
+
+    y_values: list[float] = []
+    x_labels: list[str] = []
+    y_key_used: str | None = None
+
+    for item in chart_data:
+        y_val = None
+        for key in y_candidates:
+            if key in item and item[key] is not None:
+                y_val = item[key]
+                if y_key_used is None:
+                    y_key_used = key
+                break
+        x_val = None
+        for key in x_candidates:
+            if key in item and item[key] is not None:
+                x_val = item[key]
+                break
+        if y_val is not None:
+            try:
+                y_values.append(float(y_val))
+                x_labels.append(str(x_val) if x_val is not None else f"item_{len(y_values)}")
+            except (ValueError, TypeError):
+                pass
+
+    if not y_values:
+        stats["note"] = "Could not extract numeric values from chart data"
+        logger.warning(
+            "[PRECOMPUTE] No numeric y-values found in chart_data. "
+            f"Available keys: {list(chart_data[0].keys()) if chart_data else []}. "
+            f"Tried y-candidates: {y_candidates}"
+        )
+        return stats
+
+    if y_key_used:
+        stats["y_key_used"] = y_key_used
+
+    y_clean = pd.Series(y_values)
+    x_clean = pd.Series(x_labels)
+
+    try:
+        # ── PEAKS & LOWS ──────────────────────────────────────────────────────
+        max_idx = int(y_clean.idxmax())
+        min_idx = int(y_clean.idxmin())
+        stats["peaks"] = {
+            "value": round(float(y_clean.max()), 4),
+            "label": x_clean.iloc[max_idx] if max_idx < len(x_clean) else "unknown",
+        }
+        stats["lows"] = {
+            "value": round(float(y_clean.min()), 4),
+            "label": x_clean.iloc[min_idx] if min_idx < len(x_clean) else "unknown",
+        }
+
+        # ── AVERAGES ──────────────────────────────────────────────────────────
+        stats["averages"] = {
+            "mean": round(float(y_clean.mean()), 4),
+            "median": round(float(y_clean.median()), 4),
+            "std_dev": round(float(y_clean.std()), 4) if len(y_clean) > 1 else 0,
+            "total": round(float(y_clean.sum()), 4),
+            "count": len(y_clean),
+        }
+
+        # ── TOP / BOTTOM 3 ────────────────────────────────────────────────────
+        sorted_pairs = sorted(zip(x_labels, y_values), key=lambda p: p[1], reverse=True)
+        stats["top_values"] = [
+            {"label": p[0], "value": round(p[1], 4)} for p in sorted_pairs[:3]
+        ]
+        stats["bottom_values"] = [
+            {"label": p[0], "value": round(p[1], 4)} for p in sorted_pairs[-3:]
+        ]
+
+        # ── TRENDS (3+ data points) ───────────────────────────────────────────
+        if len(y_values) >= 3:
+            try:
+                x_numeric = np.arange(len(y_values))
+                slope, intercept = np.polyfit(x_numeric, y_values, 1)
+                y_pred = slope * x_numeric + intercept
+                ss_res = np.sum((np.array(y_values) - y_pred) ** 2)
+                ss_tot = np.sum((np.array(y_values) - np.mean(y_values)) ** 2)
+                r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                mean_val = stats["averages"]["mean"]
+                if abs(slope) < 0.01 * max(abs(mean_val), 1):
+                    direction = "stable"
+                elif slope > 0:
+                    direction = "increasing"
+                else:
+                    direction = "decreasing"
+                first_val = float(y_values[0])
+                last_val = float(y_values[-1])
+                pct_change = ((last_val - first_val) / max(abs(first_val), 1)) * 100
+                stats["trends"] = {
+                    "direction": direction,
+                    "slope": round(float(slope), 6),
+                    "r_squared": round(float(r_squared), 4),
+                    "overall_change_percent": round(float(pct_change), 2),
+                    "first_value": round(first_val, 4),
+                    "last_value": round(last_val, 4),
+                    "confidence": "high" if r_squared > 0.7 else ("medium" if r_squared > 0.4 else "low"),
+                }
+            except Exception as te:
+                stats["trends"] = {"direction": "unknown", "error": str(te)}
+        else:
+            stats["trends"] = {"direction": "insufficient_data", "note": "Need at least 3 data points"}
+
+        # ── OUTLIERS via IQR (5+ data points) ────────────────────────────────
+        if len(y_values) >= 5:
+            q1 = float(y_clean.quantile(0.25))
+            q3 = float(y_clean.quantile(0.75))
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            outlier_pts = [
+                {"label": x_labels[i], "value": round(v, 4)}
+                for i, v in enumerate(y_values)
+                if v < lower or v > upper
+            ]
+            stats["outliers"] = {
+                "count": len(outlier_pts),
+                "iqr_lower": round(lower, 4),
+                "iqr_upper": round(upper, 4),
+                "outlier_points": outlier_pts[:5],
             }
-        except Exception:
-            stats["trends"] = {"direction": "unknown", "error": "Could not compute trend"}
-    else:
-        stats["trends"] = {"direction": "insufficient_data", "note": "Need at least 3 data points"}
-    
-    # ===== OUTLIERS (IQR method) =====
-    if len(y_clean) >= 4:
-        q1 = y_clean.quantile(0.25)
-        q3 = y_clean.quantile(0.75)
-        iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-        
-        outlier_mask = (y_clean < lower_bound) | (y_clean > upper_bound)
-        outlier_indices = y_clean[outlier_mask].index.tolist()
-        
-        outliers = []
-        for idx in outlier_indices[:5]:  # Limit to 5
-            outliers.append({
-                "x": str(x_clean.iloc[idx]) if idx < len(x_clean) else "N/A",
-                "y": round(float(y_clean.iloc[idx]), 4),
-                "index": idx,
-            })
-        
-        stats["outliers"] = {
-            "count": len(outlier_indices),
-            "iqr_lower_bound": round(float(lower_bound), 4),
-            "iqr_upper_bound": round(float(upper_bound), 4),
-            "outlier_points": outliers,
+        else:
+            stats["outliers"] = {"count": 0, "note": "Need at least 5 data points for IQR"}
+
+        # ── PERIOD COMPARISONS (4+ data points) ──────────────────────────────
+        if len(y_values) >= 4:
+            mid = len(y_values) // 2
+            first_half = y_clean.iloc[:mid]
+            second_half = y_clean.iloc[mid:]
+            first_avg = float(first_half.mean())
+            second_avg = float(second_half.mean())
+            cp = ((second_avg - first_avg) / max(abs(first_avg), 1)) * 100
+            stats["period_comparisons"] = {
+                "first_half_average": round(first_avg, 4),
+                "second_half_average": round(second_avg, 4),
+                "change_percent": round(float(cp), 2),
+                "first_half_total": round(float(first_half.sum()), 4),
+                "second_half_total": round(float(second_half.sum()), 4),
+            }
+
+        # ── COMPARISON TO AVERAGE ─────────────────────────────────────────────
+        stats["comparison_to_average"] = {
+            "above_average_count": int((y_clean > stats["averages"]["mean"]).sum()),
+            "below_average_count": int((y_clean < stats["averages"]["mean"]).sum()),
         }
-    else:
-        stats["outliers"] = {"count": 0, "note": "Need at least 4 data points for IQR"}
-    
-    # ===== ANOMALIES (sudden jumps/drops) =====
-    if len(y_clean) >= 5:
-        # Rolling mean with window of 3
-        rolling_mean = y_clean.rolling(window=3, center=True).mean()
-        rolling_std = y_clean.rolling(window=3, center=True).std()
-        
-        # Find points that deviate more than 2 std from rolling mean
-        anomalies = []
-        for i in range(len(y_clean)):
-            if pd.notna(rolling_mean.iloc[i]) and pd.notna(rolling_std.iloc[i]):
-                if rolling_std.iloc[i] > 0:
-                    z_score = abs(y_clean.iloc[i] - rolling_mean.iloc[i]) / rolling_std.iloc[i]
-                    if z_score > 2:
-                        anomalies.append({
-                            "x": str(x_clean.iloc[i]) if i < len(x_clean) else "N/A",
-                            "y": round(float(y_clean.iloc[i]), 4),
-                            "z_score": round(float(z_score), 2),
-                            "index": i,
-                        })
-        
-        stats["anomalies"] = {
-            "count": len(anomalies),
-            "anomaly_points": anomalies[:5],  # Limit to 5
-        }
-    else:
-        stats["anomalies"] = {"count": 0, "note": "Need at least 5 data points"}
-    
-    # ===== PERIOD COMPARISONS (first half vs second half) =====
-    if len(y_clean) >= 4:
-        mid = len(y_clean) // 2
-        first_half = y_clean.iloc[:mid]
-        second_half = y_clean.iloc[mid:]
-        
-        first_avg = first_half.mean()
-        second_avg = second_half.mean()
-        change_pct = ((second_avg - first_avg) / first_avg * 100) if first_avg != 0 else 0
-        
-        stats["period_comparisons"] = {
-            "first_half_average": round(float(first_avg), 4),
-            "second_half_average": round(float(second_avg), 4),
-            "change_percent": round(float(change_pct), 2),
-            "first_half_total": round(float(first_half.sum()), 4),
-            "second_half_total": round(float(second_half.sum()), 4),
-        }
-    else:
-        stats["period_comparisons"] = {"note": "Need at least 4 data points"}
-    
-    # ===== COMPARISON TO AVERAGE =====
-    stats["comparison_to_average"] = {
-        "above_average_count": int((y_clean > stats["averages"]["mean"]).sum()),
-        "below_average_count": int((y_clean < stats["averages"]["mean"]).sum()),
-        "at_average_count": int((y_clean == stats["averages"]["mean"]).sum()),
-    }
-    
+
+    except Exception as e:
+        logger.error(f"[PRECOMPUTE ERROR] {type(e).__name__}: {e}")
+        stats["note"] = f"Partial statistics only — {type(e).__name__}"
+
     return stats
+
+
+def build_insight_prompt(
+    chart_title: str,
+    chart_type: str,
+    x_col: str,
+    y_col: str,
+    computed_stats: dict,
+    dataset_domain: str,
+    user_goal: str,
+) -> str:
+    """Build a specific, numbers-grounded prompt that prevents generic GPT output."""
+    stats_json = json.dumps(computed_stats, indent=2, default=str)
+    return f"""
+You are a senior data analyst writing a specific, actionable insight for a business chart.
+
+CHART INFORMATION:
+- Title: {chart_title}
+- Type: {chart_type}
+- X-axis: {x_col}
+- Y-axis: {y_col}
+- Dataset domain: {dataset_domain or "general"}
+- User's analysis goal: {user_goal or "General data exploration"}
+
+COMPUTED STATISTICS (use ONLY these numbers — do not invent any):
+{stats_json}
+
+INSTRUCTIONS:
+1. Write exactly 3 insight observations. Number them.
+2. Every observation must reference a SPECIFIC number from the computed statistics above.
+3. The first observation states the single most important finding.
+4. The second observation provides context or comparison (e.g. above/below average, trend direction).
+5. The third observation is a specific actionable recommendation based on the data.
+6. Write in plain English. No jargon. No hedging phrases like "it appears" or "it seems".
+7. Never say "this chart shows" or "this chart displays" — describe the data directly.
+8. Every sentence must be specific to THIS data. Generic sentences that could apply to any chart are not acceptable.
+9. If the computed statistics show a top performer, name it. If they show an outlier, name it. If they show a trend, state its direction and magnitude.
+
+EXAMPLES OF BAD INSIGHTS (never write like this):
+- "This bar chart displays category on the X-axis and amount on the Y-axis."
+- "Insufficient numeric data was available to compute detailed statistics."
+- "The data shows various trends across different categories."
+
+EXAMPLES OF GOOD INSIGHTS (write like this):
+- "Office Supplies leads with $2.09M in revenue, just 2.4% ahead of Electronics ($2.05M) and Furniture ($2.04M)."
+- "Debit Card and Credit Card together account for 43.4% of orders, while COD represents the lowest share at 17.3%."
+- "Binders have the lowest profit at $97,257 despite reasonable sales volume — consider optimising pricing or supplier costs."
+
+Return ONLY valid JSON:
+{{
+  "insight": "1. [first observation]\\n\\n2. [second observation]\\n\\n3. [third observation]",
+  "confidence_score": 0.85,
+  "recommendations": [
+    {{"action": "Specific action", "reasoning": "Based on a specific number from the stats"}}
+  ]
+}}"""
 
 
 def generate_chart_insight(
@@ -218,74 +278,74 @@ def generate_chart_insight(
     y_header: str | None,
     chart_data: list[dict],
     user_goal: str,
+    chart_title: str = "",
+    dataset_domain: str = "",
 ) -> dict:
     """
-    Stage 5: Generate insight with pre-computation.
-    
-    1. Python computes all statistics (peaks, lows, trends, outliers, anomalies)
-    2. Pre-computed findings passed to GPT
+    Stage 5: Generate GPT-backed insight with pre-computed statistics.
+
+    1. Python computes all statistics (peaks, lows, trends, outliers, top/bottom values)
+    2. Pre-computed findings + specific prompt sent to GPT
     3. GPT writes explanations ONLY — never invents statistics
-    
+    4. Exceptions are logged and re-raised so the caller can decide whether to fall back
+
     Returns:
     {
         "insight": str,
         "confidence_score": float,
         "confidence": str,
         "recommendations": [{"action": str, "reasoning": str}],
-        "computed_statistics": dict  # The pre-computed stats
+        "computed_statistics": dict
     }
     """
-    # ===== STAGE 5: PRE-COMPUTATION =====
-    precomputed = _precompute_statistics(chart_data, x_header)
-    
+    chart_id_label = chart_title or f"{chart_type}/{x_header}"
+    logger.info(f"[GPT CALL START] generate_chart_insight for chart '{chart_id_label}'")
+    logger.info(f"[GPT INPUT] x_header={x_header!r}  y_header={y_header!r}  chart_type={chart_type!r}")
+    logger.info(f"[GPT INPUT] data_points={len(chart_data)}  user_goal={user_goal!r}")
+
+    # ── Pre-computation ───────────────────────────────────────────────────────
+    precomputed = safe_precompute_statistics(chart_data, x_header, y_header)
+    logger.info(f"[GPT INPUT] computed_stats keys: {[k for k, v in precomputed.items() if v is not None]}")
+
     y_label = y_header or "count"
-    precomputed_json = json.dumps(precomputed, indent=2, default=str)
+    title = chart_title or f"{chart_type.replace('_', ' ').title()} of {y_label} by {x_header}"
 
-    prompt = f"""You are writing insights for a {chart_type} chart.
-X-axis: "{x_header}", Y-axis: "{y_label}"
-User's analytical goal: "{user_goal}"
-
-IMPORTANT: The following statistics have been PRE-COMPUTED by Python. 
-You MUST use these exact numbers — do not invent or calculate any statistics yourself.
-
-PRE-COMPUTED STATISTICS:
-{precomputed_json}
-
-Your task:
-1. Write a natural language analysis explaining these pre-computed findings
-2. Relate the findings to the user's goal
-3. Provide 2-3 actionable recommendations based on the data
-
-Rules:
-- ONLY reference numbers that appear in the pre-computed statistics above
-- NEVER invent statistics or calculations
-- Use the exact values provided (peaks, lows, trends, outliers, etc.)
-- Set confidence_score based on the trend r_squared and data quality
-
-Return ONLY valid JSON:
-{{
-  "insight": "Natural language explanation of the pre-computed statistics...",
-  "confidence_score": 0.85,
-  "recommendations": [
-    {{"action": "Specific action to take", "reasoning": "Based on the computed statistics"}}
-  ]
-}}"""
-
-    response = _client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=1200,
+    prompt = build_insight_prompt(
+        chart_title=title,
+        chart_type=chart_type,
+        x_col=x_header,
+        y_col=y_label,
+        computed_stats=precomputed,
+        dataset_domain=dataset_domain,
+        user_goal=user_goal,
     )
+
+    try:
+        response = _client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1200,
+        )
+        logger.info(
+            f"[GPT CALL SUCCESS] chart '{chart_id_label}' — "
+            f"tokens used: {response.usage.total_tokens}"
+        )
+    except Exception as e:
+        logger.error(
+            f"[GPT CALL FAILED] chart '{chart_id_label}' — "
+            f"{type(e).__name__}: {e}"
+        )
+        raise  # Re-raise so the route can decide whether to fall back
 
     result = _parse_json(response.choices[0].message.content)
     score = float(result.get("confidence_score", 0.5))
     result["confidence"] = _confidence_category(score)
     result["confidence_score"] = round(score, 3)
-    
-    # Include the pre-computed statistics in the response
     result["computed_statistics"] = precomputed
-    
+    result["is_ai_generated"] = True
+    result["model_name"] = "gpt-4o"
+
     return result
 
 
@@ -300,19 +360,23 @@ def _generate_fallback_insight(
     Fully deterministic insight generation — no GPT required.
     Uses _precompute_statistics() to derive natural language findings.
     """
-    stats = _precompute_statistics(chart_data, x_header)
+    stats = safe_precompute_statistics(chart_data, x_header, y_header)
     y_label = y_header or "count"
 
-    if "error" in stats:
+    if stats.get("averages") is None:
+        # Pre-computation found no numeric data — return a minimal deterministic insight
+        n = stats.get("data_points", 0)
         insight = (
-            f"This {chart_type} chart displays {x_header} on the X-axis and {y_label} on the Y-axis. "
-            f"Insufficient numeric data was available to compute detailed statistics."
+            f"{n} data point{'s' if n != 1 else ''} are available for this {chart_type} chart "
+            f"({x_header} vs {y_label}), but no numeric values could be extracted for analysis."
         )
         return {
             "insight": insight,
             "confidence": "low",
             "confidence_score": 0.2,
             "recommendations": [],
+            "is_ai_generated": False,
+            "model_name": "statistical_fallback",
         }
 
     parts = []
@@ -331,8 +395,8 @@ def _generate_fallback_insight(
 
     # Peak & low
     parts.append(
-        f"The highest value is {peaks['maximum_value']:,} at '{peaks['maximum_at']}', "
-        f"while the lowest is {lows['minimum_value']:,} at '{lows['minimum_at']}'. "
+        f"The highest value is {peaks['value']:,} at '{peaks['label']}', "
+        f"while the lowest is {lows['value']:,} at '{lows['label']}'. "
         f"The mean is {avg['mean']:,} with a total of {avg['total']:,}."
     )
 
@@ -368,7 +432,7 @@ def _generate_fallback_insight(
     outliers = stats.get("outliers", {})
     if outliers.get("count", 0) > 0:
         pts = outliers["outlier_points"]
-        labels = ", ".join(f"'{p['x']}' ({p['y']:,})" for p in pts[:3])
+        labels = ", ".join(f"'{p['label']}' ({p['value']:,})" for p in pts[:3])
         parts.append(f"{outliers['count']} outlier{'s' if outliers['count'] != 1 else ''} detected: {labels}.")
         recs.append({
             "action": f"Review the outlier{'s' if outliers['count'] != 1 else ''} in {x_header}",
@@ -391,11 +455,17 @@ def _generate_fallback_insight(
         "confidence": _confidence_category(score),
         "confidence_score": round(score, 3),
         "recommendations": recs[:3],
+        "is_ai_generated": False,
+        "model_name": "statistical_fallback",
     }
 
 
 def generate_comparison_insight(deltas: list[dict], significant: list[dict]) -> str:
     """Generate a plain-text AI insight explaining comparison deltas."""
+    logger.info(
+        f"[GPT CALL START] generate_comparison_insight — "
+        f"total_deltas={len(deltas)}  significant_changes={len(significant)}"
+    )
     delta_text = json.dumps(deltas[:20], default=str, indent=2)
     sig_text = json.dumps(significant, default=str, indent=2)
 
@@ -414,11 +484,202 @@ In 3-4 sentences, explain:
 
 Be specific and concise."""
 
-    response = _client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-        max_tokens=400,
-    )
-
+    try:
+        response = _client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=400,
+        )
+        logger.info(
+            f"[GPT CALL SUCCESS] generate_comparison_insight — "
+            f"tokens used: {response.usage.total_tokens}"
+        )
+    except Exception as e:
+        logger.error(f"[GPT CALL FAILED] generate_comparison_insight — {type(e).__name__}: {e}")
+        raise
     return response.choices[0].message.content.strip()
+
+
+# ── Shared utilities used by fallback and async path ─────────────────────────
+
+def _human_label(col_name: str) -> str:
+    return col_name.replace("_", " ").replace("-", " ").title()
+
+
+def _format_number(value) -> str:
+    """Format a numeric value as a human-readable string (1.2M, 450K, etc.)."""
+    try:
+        v = float(value)
+        if abs(v) >= 1_000_000_000:
+            return f"{v / 1_000_000_000:.1f}B"
+        if abs(v) >= 1_000_000:
+            return f"{v / 1_000_000:.1f}M"
+        if abs(v) >= 1_000:
+            return f"{v / 1_000:.0f}K"
+        return f"{v:.1f}"
+    except Exception:
+        return str(value)
+
+
+def _generate_statistical_fallback(
+    stats: dict, title: str, x_col: str, y_col: str
+) -> str:
+    """
+    When GPT fails, produce a basic but honest insight from computed stats.
+    Never returns the generic 'Insufficient data' message.
+    Always references real numbers.
+    """
+    lines: list[str] = []
+
+    peaks = stats.get("peaks") or {}
+    lows = stats.get("lows") or {}
+    averages = stats.get("averages") or {}
+    trends = stats.get("trends") or {}
+
+    if peaks.get("label"):
+        lines.append(
+            f"1. {peaks['label']} has the highest {_human_label(y_col)} "
+            f"at {_format_number(peaks['value'])}."
+        )
+
+    if lows.get("label") and averages.get("mean") is not None:
+        lines.append(
+            f"2. {lows['label']} has the lowest value at {_format_number(lows['value'])}, "
+            f"compared to the average of {_format_number(averages['mean'])}."
+        )
+
+    direction = trends.get("direction")
+    if direction and direction not in ("unknown", "insufficient_data"):
+        # key may be overall_change_percent (existing) or overall_change_pct (legacy)
+        pct = trends.get("overall_change_percent", trends.get("overall_change_pct", 0))
+        lines.append(
+            f"3. The overall trend is {direction} "
+            f"with a {abs(pct):.1f}% change from first to last period."
+        )
+
+    if not lines:
+        top = stats.get("top_values", [])
+        if len(top) > 0:
+            lines.append(f"1. Top value: {top[0]['label']} at {_format_number(top[0]['value'])}.")
+        if len(top) > 1:
+            lines.append(f"2. Second: {top[1]['label']} at {_format_number(top[1]['value'])}.")
+        if len(top) > 2:
+            lines.append(f"3. Third: {top[2]['label']} at {_format_number(top[2]['value'])}.")
+
+    if lines:
+        return "\n".join(lines)
+    return f"Data computed for {title}. {stats.get('data_points', 0)} data points analyzed."
+
+
+async def generate_real_insight(
+    chart_config: dict,
+    chart_data: list,
+    dataset_context: dict,
+    openai_client,
+) -> dict:
+    """
+    Async insight generator for any chart from any domain.
+    Always calls GPT with real computed statistics.
+    Falls back to _generate_statistical_fallback only if GPT throws.
+
+    Args:
+        chart_config:     {"x": col, "y": col, "type": chart_type, "title": str}
+        chart_data:       list of dicts (Recharts-compatible payload)
+        dataset_context:  {"domain", "total_rows", "filename", "goal"}
+        openai_client:    An AsyncOpenAI instance (caller supplies it)
+
+    Returns:
+        {
+            "insight":             str,
+            "computed_statistics": dict,
+            "model":               str,
+            "tokens_used":         int | None,
+            "is_ai_generated":     bool,
+        }
+    """
+    x_col = chart_config.get("x", "")
+    y_col = chart_config.get("y", "")
+    chart_type = chart_config.get("type", "")
+    chart_title = chart_config.get("title", "")
+
+    # Step 1: Compute statistics — always produces something
+    stats = safe_precompute_statistics(chart_data, x_col, y_col)
+
+    # Step 2: Build context-aware prompt
+    sample = chart_data[:5] + chart_data[-5:] if len(chart_data) > 10 else chart_data
+    prompt = f"""You are a senior data analyst writing a specific, actionable insight.
+
+DATASET CONTEXT:
+- Domain: {dataset_context.get('domain', 'unknown')}
+- Total rows: {dataset_context.get('total_rows', 'unknown')}
+- File: {dataset_context.get('filename', 'unknown')}
+- User goal: {dataset_context.get('goal', 'General analysis')}
+
+CHART BEING ANALYZED:
+- Title: {chart_title}
+- Chart type: {chart_type}
+- X axis: {x_col}
+- Y axis: {y_col}
+
+COMPUTED STATISTICS (reference these exact numbers):
+{json.dumps(stats, indent=2, default=str)}
+
+RAW DATA SAMPLE (first 5 and last 5 data points):
+{json.dumps(sample, indent=2, default=str)}
+
+YOUR TASK:
+Write exactly 3 numbered insights. Rules:
+1. Every insight references a specific number from the statistics above.
+2. Insight 1: The single most important finding — name the top/bottom performer or the strongest trend.
+3. Insight 2: A comparison or context — how does the top compare to the average? Is the trend accelerating or slowing?
+4. Insight 3: A specific actionable recommendation — what should the user investigate or do based on this data?
+5. Never write generic sentences. Every sentence must be unique to this specific chart's data.
+6. Never start with "This chart shows" or "The chart displays".
+7. If you see the top value, name it. If you see an outlier, describe it specifically.
+8. Write for a business decision maker, not a data scientist.
+
+CRITICAL: If the data has fewer than 3 points, still write 3 insights focused on what the data does show."""
+
+    logger.info(f"[GPT INSIGHT] generate_real_insight called for chart: {chart_title!r}")
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior data analyst. You write specific, number-backed insights. "
+                        "You never write generic observations. "
+                        "You always name specific values from the data."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=400,
+            temperature=0.3,
+        )
+        insight_text = response.choices[0].message.content.strip()
+        tokens_used = response.usage.total_tokens
+        logger.info(f"[GPT INSIGHT SUCCESS] {chart_title!r} — {tokens_used} tokens")
+        return {
+            "insight": insight_text,
+            "computed_statistics": stats,
+            "model": "gpt-4o",
+            "tokens_used": tokens_used,
+            "is_ai_generated": True,
+        }
+
+    except Exception as e:
+        logger.error(
+            f"[GPT INSIGHT FAILED] {chart_title!r} — {type(e).__name__}: {e}"
+        )
+        return {
+            "insight": _generate_statistical_fallback(stats, chart_title, x_col, y_col),
+            "computed_statistics": stats,
+            "model": "statistical_fallback",
+            "tokens_used": None,
+            "is_ai_generated": False,
+            "error": str(e),
+        }

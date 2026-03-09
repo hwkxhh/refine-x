@@ -80,7 +80,14 @@ export default function InsightsPage() {
           visible.map((insight) => (
             <div key={insight.id} className="rounded-xl border border-border bg-card/60 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-                <Badge variant="info">Insight #{insight.id}</Badge>
+                <div className="flex items-center gap-2">
+                  <Badge variant="info">Insight #{insight.id}</Badge>
+                  {insight.is_ai_generated != null && (
+                    <Badge variant={insight.is_ai_generated ? 'info' : 'default'}>
+                      {insight.is_ai_generated ? 'AI' : 'Computed'}
+                    </Badge>
+                  )}
+                </div>
                 {insight.confidence_score != null && (
                   <Badge variant={confidenceBadge(insight.confidence_score)}>
                     {insight.confidence_score}% confidence

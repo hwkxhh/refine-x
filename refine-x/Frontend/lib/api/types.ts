@@ -133,8 +133,18 @@ export interface UnnecessaryColumn {
   impact_if_removed: string;
 }
 
+export interface AnalyzedColumn {
+  column: string;
+  decision: 'keep' | 'drop';
+  what_it_measures: string;
+  why: string;
+  analytical_use: string | null;
+  warning: string | null;
+}
+
 export interface HeaderAnalysisResponse {
   job_id: number;
+  columns: AnalyzedColumn[];
   unnecessary_columns: UnnecessaryColumn[];
   essential_columns: string[];
   dataset_summary: string;
@@ -233,6 +243,8 @@ export interface InsightResponse {
   confidence: string;
   confidence_score: number;
   recommendations: { action: string; reasoning: string }[] | null;
+  is_ai_generated: boolean | null;
+  model_name: string | null;
 }
 
 export interface AnnotationResponse {

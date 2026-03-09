@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
-from openai import RateLimitError, AuthenticationError, APIStatusError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -20,6 +21,7 @@ from app.services.ai_insights import generate_chart_insight, _generate_fallback_
 from app.services.auth import get_current_user
 from app.services.cache import get_cached_dataframe
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["insights-annotations"])
 
 
@@ -57,8 +59,14 @@ def generate_insight(
             y_header=chart.y_header,
             chart_data=chart.data or [],
             user_goal=user_goal,
+            chart_title=chart.title or "",
         )
-    except (RateLimitError, AuthenticationError, APIStatusError):
+    except Exception as e:
+        # Log the real failure reason so we can diagnose it from logs
+        logger.error(
+            f"[INSIGHT FALLBACK] chart_id={chart_id}  "
+            f"{type(e).__name__}: {e}  — switching to deterministic fallback"
+        )
         result = _generate_fallback_insight(
             chart_type=chart.chart_type,
             x_header=chart.x_header,
@@ -74,6 +82,8 @@ def generate_insight(
         confidence=result["confidence"],
         confidence_score=result["confidence_score"],
         recommendations=result.get("recommendations", []),
+        is_ai_generated=result.get("is_ai_generated"),
+        model_name=result.get("model_name"),
     )
     db.add(insight)
     db.commit()

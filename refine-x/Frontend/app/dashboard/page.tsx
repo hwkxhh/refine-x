@@ -234,7 +234,14 @@ export default function DashboardPage() {
                 {recentInsights.map((insight) => (
                   <div key={insight.id} className="rounded-xl border border-border bg-card/60 p-4">
                     <div className="flex items-center justify-between gap-3 mb-2">
-                      <Badge variant="info">{insight.confidence.toUpperCase()}</Badge>
+                      <div className="flex items-center gap-2">
+                        <Badge variant="info">{insight.confidence.toUpperCase()}</Badge>
+                        {insight.is_ai_generated != null && (
+                          <Badge variant={insight.is_ai_generated ? 'info' : 'default'}>
+                            {insight.is_ai_generated ? 'AI' : 'Computed'}
+                          </Badge>
+                        )}
+                      </div>
                       <p className="text-xs text-text-muted">Score: {Math.round(insight.confidence_score * 100)}%</p>
                     </div>
                     <p className="text-sm text-foreground leading-relaxed">{insight.content}</p>

@@ -126,7 +126,14 @@ export default function InsightsPage({ params }: { params: Promise<{ id: string 
                   </div>
                   <div className="flex-1">
                     <div className="flex items-start justify-between mb-2 gap-2">
-                      <p className="font-medium text-foreground">Insight #{insight.id}</p>
+                      <div className="flex items-center gap-2">
+                        <p className="font-medium text-foreground">Insight #{insight.id}</p>
+                        {insight.is_ai_generated != null && (
+                          <Badge variant={insight.is_ai_generated ? 'info' : 'default'}>
+                            {insight.is_ai_generated ? 'AI' : 'Computed'}
+                          </Badge>
+                        )}
+                      </div>
                       {insight.confidence_score != null && (
                         <Badge variant={insight.confidence_score >= 80 ? 'success' : insight.confidence_score >= 60 ? 'warning' : 'error'}>
                           {insight.confidence_score}% confidence

@@ -22,6 +22,7 @@ from app.services.auth import get_current_user
 from app.services.cache import get_cached_dataframe
 from app.services.chart_engine import ChartEngine
 from app.services.chart_suite import generate_full_chart_suite
+from app.services.column_role_classifier import get_plottable_columns, NEVER_USE_AS_AXIS
 
 router = APIRouter(prefix="/jobs", tags=["charts"])
 
@@ -93,9 +94,15 @@ def get_recommendations(
 
     df = _get_df_or_422(job_id)
     sample = df.head(5).fillna("").to_dict(orient="records")
+
+    # Only expose plottable columns to the recommendation engine
+    _role_info = get_plottable_columns(df)
+    _blocked_rec = {b["column"] for b in _role_info["blocked"]}
+    safe_column_names = [c for c in df.columns.tolist() if c not in _blocked_rec]
+
     try:
         recs = recommend_headers(
-            column_names=df.columns.tolist(),
+            column_names=safe_column_names,
             data_sample=sample,
             user_goal=goal.goal_text,
             df=df,
@@ -122,6 +129,37 @@ def generate_chart(
         raise HTTPException(status_code=400, detail=f"Column '{payload.x_col}' not found in dataset")
     if payload.y_col and payload.y_col not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{payload.y_col}' not found in dataset")
+
+    # ── Role-gate: permanently block identifier/sequence/constant columns ───
+    _role_info = get_plottable_columns(df)
+    _blocked = {b["column"]: b["role"] for b in _role_info["blocked"]}
+    if payload.x_col in _blocked:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Column '{payload.x_col}' cannot be used as a chart axis: "
+                f"classified as '{_blocked[payload.x_col]}' "
+                f"(identifiers, sequences, and constants are never plotted)."
+            ),
+        )
+    if payload.y_col and payload.y_col in _blocked:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Column '{payload.y_col}' cannot be used as a chart axis: "
+                f"classified as '{_blocked[payload.y_col]}' "
+                f"(identifiers, sequences, and constants are never plotted)."
+            ),
+        )
+    # Y axis must be a quantitative metric — not a category, date, or code
+    if payload.y_col and payload.y_col not in _role_info["metric_cols"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Column '{payload.y_col}' is not a quantitative metric and "
+                f"cannot be used as a Y axis. Only METRIC columns can be Y axes."
+            ),
+        )
 
     # Prevent nonsense same-column charts (e.g. "Year vs Year")
     y_col = None if payload.y_col == payload.x_col else payload.y_col

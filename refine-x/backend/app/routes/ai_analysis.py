@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import logging
 from fastapi import APIRouter, Depends, HTTPException
-from openai import RateLimitError, AuthenticationError, APIStatusError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -9,15 +9,19 @@ from app.models.cleaning_log import CleaningLog
 from app.models.upload_job import UploadJob
 from app.models.user import User
 from app.schemas.ai_charts import (
+    AnalyzedColumn,
     DropColumnsRequest,
     FormulaSuggestionsResponse,
     HeaderAnalysisResponse,
+    UnnecessaryColumn,
 )
-from app.services.ai_analysis import analyze_headers, suggest_formulas, suggest_analyses_and_viz
+from app.services.ai_analysis import suggest_formulas, suggest_analyses_and_viz
+from app.services.column_relevance import analyze_columns_for_header_gate
 from app.services.auth import get_current_user
 from app.services.cache import cache_dataframe, get_cached_dataframe
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/jobs", tags=["ai-analysis"])
 
 
@@ -49,68 +53,67 @@ def analyze_job_headers(
     current_user: User = Depends(get_current_user),
 ):
     """
-    AI reviews all column names + sample data and identifies:
-    - Unnecessary columns (with reasons)
-    - Essential columns
-    - What the dataset is about
+    GPT evaluates every column and explains:
+    - What it actually measures (plain English)
+    - Whether to keep or drop it (with specific reasoning)
+    - What analysis it enables (for keep columns)
+    - Any data quality warnings
     """
     job = _get_job_or_404(job_id, current_user, db)
     df = _get_df_or_422(job_id)
 
     sample_rows = df.head(5).fillna("").to_dict(orient="records")
     columns = [str(c) for c in df.columns.tolist()]
+    total_rows = len(df)
 
-    try:
-        result = analyze_headers(
-            columns=columns,
-            sample_rows=sample_rows,
-            filename=job.filename,
-        )
-    except (RateLimitError, AuthenticationError, APIStatusError):
-        # GPT unavailable — return all columns as essential with no AI suggestions
-        return HeaderAnalysisResponse(
-            job_id=job_id,
-            unnecessary_columns=[],
-            essential_columns=df.columns.tolist(),
-            dataset_summary=(
-                f"{job.filename} — {len(df)} rows × {len(df.columns)} columns. "
-                "AI classification unavailable (OpenAI quota exceeded)."
-            ),
-        )
+    # ── Call the new GPT-powered column analysis ──────────────────────────
+    raw_results = analyze_columns_for_header_gate(
+        columns=columns,
+        sample_rows=sample_rows,
+        filename=job.filename,
+        total_rows=total_rows,
+        df=df,
+    )
 
-    # Legacy analyze_headers returns {"columns": {"col": {"htype": ..., "confidence": ...}}}
-    # Derive unnecessary/essential from confidence scores
-    columns_data = result.get("columns", {})
-    unnecessary = []
-    essential = []
-    for col, info in columns_data.items():
-        htype = info.get("htype", "HTYPE-000")
-        confidence = info.get("confidence", 0.5)
-        if htype == "HTYPE-000" or confidence < 0.5:
-            unnecessary.append({
-                "column": col,
-                "reason": f"Low confidence classification ({confidence:.0%}) — column may be redundant or duplicated",
-                "impact_if_removed": "Low — column appears to contain unclear or derived data",
-            })
+    # ── Build typed response objects ──────────────────────────────────────
+    analyzed: list[AnalyzedColumn] = []
+    essential: list[str] = []
+    unnecessary: list[UnnecessaryColumn] = []
+
+    for item in raw_results:
+        col = AnalyzedColumn(
+            column=item["column"],
+            decision=item["decision"],
+            what_it_measures=item["what_it_measures"],
+            why=item["why"],
+            analytical_use=item.get("analytical_use"),
+            warning=item.get("warning"),
+        )
+        analyzed.append(col)
+
+        if item["decision"] == "keep":
+            essential.append(item["column"])
         else:
-            essential.append(col)
+            unnecessary.append(UnnecessaryColumn(
+                column=item["column"],
+                reason=item["why"],
+                impact_if_removed="Low — this column was flagged as having minimal analytical value.",
+            ))
 
-    # Build a brief dataset summary from the HTYPE distribution
-    htype_counts: dict[str, int] = {}
-    for info in columns_data.values():
-        h = info.get("htype", "HTYPE-000")
-        htype_counts[h] = htype_counts.get(h, 0) + 1
-    top_types = sorted(htype_counts.items(), key=lambda x: -x[1])[:3]
-    summary_parts = [f"{h} ×{c}" for h, c in top_types]
+    # ── Build dataset summary from GPT results ────────────────────────────
+    keep_count = len(essential)
+    drop_count = len(unnecessary)
     dataset_summary = (
-        f"{job.filename} — {len(df)} rows × {len(df.columns)} columns. "
-        f"Dominant types: {', '.join(summary_parts)}."
+        f"{job.filename} — {total_rows:,} rows × {len(columns)} columns. "
+        f"AI recommends keeping {keep_count} column{'s' if keep_count != 1 else ''}"
+        + (f" and dropping {drop_count}." if drop_count > 0 else ".")
     )
 
     return HeaderAnalysisResponse(
         job_id=job_id,
-        unnecessary_columns=unnecessary,
+        columns=analyzed,
         essential_columns=essential,
+        unnecessary_columns=unnecessary,
         dataset_summary=dataset_summary,
     )
 
